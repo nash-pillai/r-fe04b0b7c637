@@ -165,6 +165,138 @@ class DecisionTests(unittest.TestCase):
         self.assertFalse(action["boost"])
         self.assertFalse(action["fire"][1])
 
+    def opponent(self, ident, x, y, hp=1400, weapon="gun", aiming_at_us=True):
+        # The new fixtures assert tactical headings on open ground.
+        self.bot.arena.waypoint = lambda pos, goal: goal
+        enemy = self.enemy(x, y)
+        yaw = math.atan2(-y, -x) if aiming_at_us else math.atan2(y, x)
+        enemy.update(id=ident, hp=hp, max_hp=1400, weapons=[weapon], aim=[yaw, 0])
+        return enemy
+
+    def test_clear_finisher_over_nearer_covered_mech(self):
+        self.opponent(2, 30, 0)
+        target = self.opponent(4, 54, 36, hp=220)
+        self.bot.arena.solid = lambda x, y, z, pad=0: 12 < x < 18 and abs(y) < 3
+        action = self.bot.act(self.obs)
+        yaw = math.atan2(target["pos"][1], target["pos"][0])
+        self.assertAlmostEqual(action["aim"][0], yaw)
+        self.assertGreater(sum(a*b for a,b in zip(action["move"], [math.cos(yaw), math.sin(yaw)])), .25)
+
+    def test_focus_survives_small_range_change_and_switches_for_finish(self):
+        self.opponent(2, 86, 20, aiming_at_us=False)
+        other = self.opponent(4, 90, -20, aiming_at_us=False)
+        self.assertGreater(self.bot.act(self.obs)["aim"][0], 0)
+        self.obs["t"] += .1
+        other["pos"][0] = 82
+        self.obs["mechs"].reverse()
+        self.assertGreater(self.bot.act(self.obs)["aim"][0], 0)
+        self.obs["t"] += .1
+        other["hp"] = 180
+        self.assertLess(self.bot.act(self.obs)["aim"][0], 0)
+
+    def test_healthy_duel_kites_then_closes_on_wounded_opponent(self):
+        enemy = self.opponent(4, 84, 0)
+        self.assertLess(self.bot.act(self.obs)["move"][0], -.25)
+        enemy["hp"] = 240
+        self.obs["t"] += .1
+        self.assertGreater(self.bot.act(self.obs)["move"][0], .25)
+
+    def test_spacing_uses_equipped_lightning_range(self):
+        self.opponent(4, 50, 0)
+        lightning = self.equip("lightning")
+        self.assertGreater(self.bot.act(self.obs)["move"][0], .2)
+        lightning["stats"]["range"] = 80
+        self.obs["t"] += .1
+        self.assertLess(self.bot.act(self.obs)["move"][0], -.2)
+
+    def test_crossfire_overrides_isolated_finish(self):
+        self.opponent(2, 75, 20, hp=220)
+        self.opponent(4, 80, -20)
+        action = self.bot.act(self.obs)
+        self.assertLess(action["move"][0], -.9)
+        self.assertTrue(action["boost"])
+
+    def test_opposite_shooters_escape_laterally(self):
+        self.opponent(2, 44, 0, hp=220)
+        self.opponent(4, -44, 0)
+        self.assertGreater(abs(self.bot.act(self.obs)["move"][1]), .9)
+
+    def test_loot_over_distant_distracted_or_out_of_range_shooter(self):
+        enemy = self.opponent(2, 125, 0, aiming_at_us=False)
+        self.obs["cubes"] = [dict(id=5000, pos=[0, 7, 0])]
+        self.assertGreater(self.bot.act(self.obs)["move"][1], .9)
+        enemy.update(weapons=["lightning"], aim=[math.pi, 0], hp=100)
+        self.obs["t"] += .1
+        self.assertGreater(self.bot.act(self.obs)["move"][1], .9)
+
+    def test_pickup_over_covered_near_shooter(self):
+        self.opponent(2, 34, 0)
+        self.bot.arena.solid = lambda x, y, z, pad=0: 12 < x < 18 and abs(y) < 3
+        self.obs["pickups"] = [dict(id=8001, kind="laser", pos=[0, 7, 0])]
+        self.assertGreater(self.bot.act(self.obs)["move"][1], .9)
+
+    def test_last_open_position_expires_even_with_server_tracking(self):
+        enemy = self.opponent(4, 84, 0, hp=240)
+        self.assertGreater(self.bot.act(self.obs)["move"][0], .25)
+        self.obs["t"] += .5
+        enemy["pos"] = [60, 40, 0]
+        self.bot.arena.clear = lambda *args: False
+        action = self.bot.act(self.obs)
+        self.assertGreater(action["move"][0], .9)
+        self.assertFalse(any(action["fire"]))
+        self.obs["t"] += .51
+        self.assertEqual(self.bot.act(self.obs)["move"], [0, 0])
+
+    def test_lost_target_yields_to_cube_and_kill_cancels_pursuit(self):
+        enemy = self.opponent(4, 84, 0, hp=240)
+        self.bot.act(self.obs)
+        self.obs["mechs"] = []
+        self.obs["t"] += .1
+        self.obs["cubes"] = [dict(id=5000, pos=[0, 7, 0])]
+        self.assertGreater(self.bot.act(self.obs)["move"][1], .9)
+        self.obs["cubes"] = []
+        self.obs["mechs"] = [enemy]
+        self.obs["t"] += .1
+        self.bot.act(self.obs)
+        self.obs["mechs"] = []
+        self.obs["events"] = [dict(type="kill", target=4)]
+        self.obs["t"] += .1
+        self.assertEqual(self.bot.act(self.obs)["move"], [0, 0])
+
+    def test_projected_edge_overrides_crossfire_escape(self):
+        self.obs["t"] = 80
+        self.me.update(pos=[-115, 0, 0], in_zone=True)
+        self.obs["zone"].update(center=[0, 0], next_center=[20, 0], radius=120, next_radius=60)
+        self.opponent(2, -65, 10)
+        self.opponent(4, -65, -10)
+        action = self.bot.act(self.obs)
+        self.assertGreater(action["move"][0], .9)
+        self.assertFalse(action["boost"])
+
+    def test_blocked_lead_rejects_finish_but_respects_incoming_shot(self):
+        enemy = self.opponent(2, 90, 0, hp=170)
+        enemy["vel"] = [0, 19, 0]
+        self.bot.arena.solid = lambda x, y, z, pad=0: 50 < x < 60 and y > 2
+        action = self.bot.act(self.obs)
+        self.assertLess(action["move"][0], -.25)
+        self.assertAlmostEqual(action["aim"][0], 0)
+        self.assertFalse(any(action["fire"]))
+
+    def test_clear_lead_does_not_refresh_a_target_behind_cover(self):
+        enemy = self.opponent(2, 84, 0, hp=170)
+        enemy["vel"] = [0, 18, 0]
+        self.bot.arena.solid = lambda x, y, z, pad=0: 65 < x < 78 and abs(y) < 3
+        self.assertTrue(self.bot.aim_at(self.me, enemy, self.me["weapons"][0])[3])
+        self.assertEqual(self.bot.act(self.obs)["move"], [0, 0])
+
+    def test_recent_hit_counts_distracted_second_shooter(self):
+        self.opponent(2, 75, 20, hp=220)
+        self.opponent(4, 80, -20, aiming_at_us=False)
+        self.obs["events"] = [dict(type="damaged", by=4, weapon="gun", amount=45, bearing=-.24)]
+        action = self.bot.act(self.obs)
+        self.assertLess(action["move"][0], -.9)
+        self.assertTrue(action["boost"])
+
 
 if __name__ == "__main__":
     KIT = sys.argv.pop(1)

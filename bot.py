@@ -35,6 +35,8 @@ class Bot:
         self.last_goal=-100
         self.recovering=False
         self.direction=1 if hello['slot']%2 else -1
+        self.focus_id = None
+        self.pursuit = None
 
     def aim_at(self,me,target,weapon):
         kind=weapon['kind'];s=weapon['stats'];p=me['pos']
@@ -84,6 +86,67 @@ class Bot:
         else:clear=self.arena.clear(source,q)
         return yaw,pitch,d,clear
 
+    def shot_option(self, me, target, primary):
+        if not primary:
+            return None
+        sol = self.aim_at(me, target, primary)
+        if not sol or not sol[3] or sol[2] > primary['stats'].get('range', 230):
+            return None
+        if primary['kind'] == 'mortar' and sol[2] < 25:
+            return None
+        hp = target.get('hp', self.config['mech']['hp'])
+        if self.recovering and (target['kind'] != 'mech' or sol[2] > 30 or hp > 200):
+            return None
+        score = sol[2] + .05 * hp
+        if target['kind'] != 'mech':
+            score += 80
+        elif target['id'] == self.focus_id:
+            score -= 20
+        return score, target, sol
+
+    def assess_opponents(self, o, enemies, primary):
+        me = o['self']
+        x, y, z = me['pos']
+        stats = me['stats']
+        rules = self.config['weapons']
+        vision = self.config['vision']
+        near = vision['near_range'] + stats.get('near_range_bonus', 0)
+        seen_range = vision['range'] + stats.get('vision_bonus', 0)
+        center = (x, y, z + .5 * stats['height'])
+        attackers = {e.get('by') for e in o['events'] if e['type'] == 'damaged'}
+        threats, shots = [], []
+        for enemy in enemies:
+            ex, ey, ez = enemy['pos']
+            distance = math.hypot(ex - x, ey - y)
+            bearing = math.atan2(ey - y, ex - x)
+            scale = 1 + self.config['cubes']['size_per_cube'] * enemy.get('cubes', 0)
+            facing = abs(angle(enemy.get('aim', (bearing + math.pi,))[0] - bearing - math.pi))
+            if distance < 1.5 * vision['near_range'] or facing < .6 or enemy['id'] in attackers:
+                reach = 0
+                for kind in enemy.get('weapons', ('gun',)):
+                    weapon = rules[kind]
+                    reach = max(reach, weapon['speed']**2 / weapon['gravity'] if kind == 'mortar' else weapon['range'])
+                muzzle = (ex, ey, ez + self.config['mech']['muzzle_height'] * scale)
+                if math.dist(muzzle, center) <= reach and self.arena.clear(muzzle, center):
+                    threats.append(enemy)
+            # The server can list a mech behind a wall or outside our sensors for five seconds.
+            if distance > near and (distance > seen_range or
+                    abs(angle(bearing - me['aim'][0])) > math.radians(vision['fov_deg']) / 2):
+                continue
+            option = self.shot_option(me, enemy, primary)
+            if not option:
+                continue
+            # A clear lead or lob can pass a corner while the tracked body is still hidden.
+            if enemy not in threats and (any(enemy.get('vel', ())) or primary['kind'] == 'mortar'):
+                eye = (x, y, z + stats['eye_height'])
+                body = (ex, ey, ez + .52 * self.config['mech']['height'] * scale)
+                if not self.arena.clear(eye, body):
+                    continue
+            shots.append(option)
+        threat_ids = {e['id'] for e in threats}
+        shot = min(shots, key=lambda s: (s[1]['id'] not in threat_ids, s[0], s[1]['id']), default=None)
+        return threats, shot
+
     def act(self,o):
         me=o['self'];p=me['pos'];x,y,z=p;t=o['t'];zone=o['zone'];a={'tick':o['tick']}
         hp=me['hp']/me['max_hp'];energy=me['energy'];stats=me['stats'];radius=stats.get('radius',2.5)
@@ -96,6 +159,14 @@ class Bot:
         enemies=[e for e in o['mechs'] if e['kind']=='mech']
         nearest=min((math.dist(e['pos'][:2],p[:2]) for e in enemies),default=999)
         held=[w['kind'] for w in me['weapons'] if w]
+        weapons=me['weapons'];primary=next((w for w in weapons if w and w['kind']=='laser' and w['cooldown']<=.1),None) or next((w for w in weapons if w and w['kind']=='gun'),None)
+        gun_for_mortar=next((w for w in weapons if w and w['kind']=='gun'),None)
+        mortar=next((w for w in weapons if w and w['kind']=='mortar' and w['cooldown']<=.05),None)
+        if mortar and gun_for_mortar and (gun_for_mortar.get('reload',0)>0 or gun_for_mortar.get('ammo',0)==0):primary=mortar
+        threats, shot = self.assess_opponents(o, enemies, primary)
+        nearest_threat = min(threats, key=lambda e: math.dist(e['pos'], p), default=None)
+        target = shot[1] if shot else None
+        threat = target if target is not None and (not threats or target in threats) else nearest_threat
         value={'gun':0,'mortar':1,'lightning':2,'laser':3}
         pickups=[q for q in o['pickups'] if q['kind'] not in held]
         for q in sorted(pickups,key=lambda q:-value[q['kind']]):
@@ -136,20 +207,58 @@ class Bot:
                 if q['lands_in']<18 and (q['holder'] in (None,me['id'])):candidate(q,90 if hp<.65 else 50)
             if priorities:_,goal,arrival=min(priorities)
             elif dnext<safe_r*.65:goal=p[:2]
-        # A threat's back is unsafe. Kite at gun range while retaining front armor.
-        threat=min(enemies,key=lambda e:math.dist(e['pos'],p),default=None)
-        if threat and nearest<155 and not urgent:
-            arrival=4.
+        # Only remember the last open, favorable approach. A tracked position behind
+        # cover, a kill, or a second firing lane must never extend the chase.
+        if (urgent or recovering or threats or target or priorities or
+                any(e['type'] == 'kill' and e['target'] == self.focus_id for e in o['events'])):
+            self.pursuit = None
+        if self.pursuit and t >= self.pursuit[1]:
+            self.pursuit = None
+        if target:
+            self.focus_id = target['id']
+        elif not self.pursuit:
+            self.focus_id = None
+        combat_goal = None
+        crossfire = len(threats) >= 2
+        if crossfire and not urgent:
+            # Maximize separation from the worst bearing; opposite shooters favor a lateral exit.
+            bearings = [unit(x-e['pos'][0], y-e['pos'][1]) for e in threats]
+            headings = [(math.cos(i*math.pi/8), math.sin(i*math.pi/8)) for i in range(16)]
+            ux, uy = max(headings, key=lambda h: min(h[0]*u + h[1]*v for u,v in bearings))
+            combat_goal = (x + 35*ux, y + 35*uy)
+        elif threat and not urgent:
             ex,ey=threat['pos'][:2];ux,uy=unit(x-ex,y-ey)
-            desired=125 if recovering else 72 if 'lightning' in held else 115
-            radial=max(-1,min(1,(desired-nearest)/35))
-            tangent=.8*self.direction
-            goal=(x+35*(ux*radial-uy*tangent),y+35*(uy*radial+ux*tangent))
+            distance = math.hypot(x-ex, y-ey)
+            reach = primary['stats'].get('range', 230) if primary else self.config['weapons']['gun']['range']
+            lightning = next((w['stats'] for w in weapons if w and w['kind'] == 'lightning'), None)
+            arc_ready = lightning and energy > lightning['energy'] + 10
+            can_attack = target is threat and not recovering and (arc_ready or
+                not primary.get('reload', 0) and primary.get('ammo', 1) > 0)
+            weak = can_attack and threat.get('hp', me['max_hp']) < .4 * min(me['hp'], threat.get('max_hp', self.config['mech']['hp']))
+            if threats or (can_attack and distance < .7*reach and
+                           (not priorities or weak and distance < math.dist(p[:2], goal[:2]))):
+                desired = .5 * reach
+                if not can_attack:
+                    desired = max(distance + 20, .6 * reach)
+                elif arc_ready:
+                    desired = .78 * lightning['range']
+                elif weak:
+                    desired = max(30, .2 * reach)
+                radial=max(-1,min(1,(desired-distance)/35))
+                tangent=.8*self.direction
+                combat_goal=(x+35*(ux*radial-uy*tangent),y+35*(uy*radial+ux*tangent))
+                if weak and distance > desired:
+                    self.pursuit = (tuple(threat['pos'][:2]), t + 1.)
+        elif self.pursuit:
+            combat_goal = self.pursuit[0]
+        if combat_goal is not None:
+            goal = combat_goal
+            arrival=4.
             cg = math.dist(goal, safe_center)
             if cg > safe_radius - safe_margin:
                 fraction = (safe_radius - safe_margin) / cg
                 goal = tuple(c + (g - c) * fraction for c, g in zip(safe_center, goal))
-        if recovering and threat and not urgent:
+        if recovering and nearest_threat and not crossfire and not urgent:
             hidden=[]
             muzzle=stats.get('eye_height',8)
             eye=(threat['pos'][0],threat['pos'][1],threat['pos'][2]+8)
@@ -201,29 +310,22 @@ class Bot:
         if self.stuck>8 and best[0]<-1e20:move=(gx,gy)
         self.previous=p
         a['jump']=bool(me['grounded'] and self.stuck>8)
-        a['boost']=bool(energy>35 and (not me['in_zone'] or (recovering and nearest<120) or self.stuck>8))
+        escape = (crossfire and not urgent) or (recovering and nearest_threat and math.dist(nearest_threat['pos'][:2],p[:2])<120)
+        a['boost']=bool(energy>35 and (not me['in_zone'] or escape or self.stuck>8))
         speed=stats['boost_speed'] if a['boost'] else stats['walk_speed']
         match=self.config['match']
         interval=match['decide_every']/match['tick_hz']
         fraction=min(1.,distance/max(1e-8,speed*interval))
         a['move']=[component*fraction for component in move]
         # Shared torso aim favors laser hitscan, then gun, then ballistics.
-        weapons=me['weapons'];primary=next((w for w in weapons if w and w['kind']=='laser' and w['cooldown']<=.1),None) or next((w for w in weapons if w and w['kind']=='gun'),None)
-        gun_for_mortar=next((w for w in weapons if w and w['kind']=='gun'),None)
-        mortar=next((w for w in weapons if w and w['kind']=='mortar' and w['cooldown']<=.05),None)
-        if mortar and gun_for_mortar and (gun_for_mortar.get('reload',0)>0 or gun_for_mortar.get('ammo',0)==0):primary=mortar
-        targets=enemies[:]
-        if not recovering and nearest>75:
-            targets+=o['crates'] and [dict(q,kind='crate') for q in o['crates']] or []
+        options = [shot] if shot else []
+        if not recovering and not threats:
+            targets = [dict(q,kind='crate') for q in o['crates']]
             targets += [e for e in o['mechs'] if e['kind']=='npc' and math.dist(e['pos'][:2],p[:2])<110]
-        options=[]
-        if primary:
             for target in targets:
-                sol=self.aim_at(me,target,primary)
-                if not sol or not sol[3] or sol[2]>primary['stats'].get('range',230) or (primary['kind']=='mortar' and sol[2]<25):continue
-                score=target.get('hp',1400)*.05+sol[2]+(0 if target['kind']=='mech' else 80)
-                if recovering and (target['kind']!='mech' or sol[2]>30 or target.get('hp',1400)>200):continue
-                options.append((score,target,sol))
+                option = self.shot_option(me, target, primary)
+                if option:
+                    options.append(option)
         a['fire']=[False,False]
         if options:
             _,target,sol=min(options,key=lambda q:q[0]);a['aim']=list(sol[:2])
@@ -263,7 +365,7 @@ class Bot:
                     a['fire'][i]=bool(use_mortar and aligned and clear)
         else:
             bearing=next((e['bearing'] for e in o['events'] if e['type']=='damaged' and e.get('bearing') is not None),None)
-            if bearing is None and recovering and threat:
+            if bearing is None and threat:
                 bearing=math.atan2(threat['pos'][1]-y,threat['pos'][0]-x)
             a['aim']=[bearing if bearing is not None else math.atan2(gy,gx)+math.sin(t*.9)*1.6,0]
             # A released laser still fires, so point it toward any remembered threat.
