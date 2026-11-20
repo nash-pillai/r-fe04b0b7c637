@@ -88,6 +88,29 @@ class DecisionTests(unittest.TestCase):
         speed = self.me["stats"]["boost_speed" if action["boost"] else "walk_speed"]
         self.assertLessEqual(math.hypot(*move) * speed * interval, .45 + 1e-8)
 
+    def test_shrinking_zone_allows_loot_inside_next_ring(self):
+        self.obs["t"] = 80
+        self.me["in_zone"] = True
+        self.obs["zone"].update(center=[0, 0], next_center=[30, 0], radius=160)
+        self.obs["cubes"] = [dict(id=5000, pos=[-6, 0, 0])]
+        self.assertLess(self.bot.act(self.obs)["move"][0], -.9)
+
+    def test_shrinking_zone_prioritizes_intercept_near_edge(self):
+        self.obs["t"] = 80
+        self.me.update(pos=[-115, 0, 0], in_zone=True)
+        self.obs["zone"].update(center=[0, 0], next_center=[20, 0],
+                                radius=120, next_radius=60)
+        self.obs["cubes"] = [dict(id=5000, pos=[-118, 0, 0])]
+        self.assertGreater(self.bot.act(self.obs)["move"][0], .9)
+
+    def test_shrinking_zone_skips_loot_outside_projected_ring(self):
+        self.obs["t"] = 103
+        self.me["in_zone"] = True
+        self.obs["zone"].update(center=[0, 0], next_center=[20, 0],
+                                radius=100, next_radius=70)
+        self.obs["cubes"] = [dict(id=5000, pos=[-84, 0, 0])]
+        self.assertEqual(self.bot.act(self.obs)["move"], [0, 0])
+
     def test_approach_half_meter_does_not_probe_beyond_goal(self):
         self.bot.arena.solid = lambda x, y, z, pad=0: x >= 1.5
         self.assertTrue(self.bot.arena.traversable((0, 0, 0), 1, 0, .5, 2.8, 9))

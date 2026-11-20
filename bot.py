@@ -12,6 +12,15 @@ def unit(x,y):
     return (x/d,y/d) if d>1e-8 else (0.,0.)
 
 
+def projected_zone(zone, now, seconds):
+    start = max(now, zone["shrink_start"])
+    end = zone["shrink_end"]
+    fraction = min(1.0, max(0.0, (now + seconds - start) / (end - start))) if end > start else 1.0
+    center = tuple(a + fraction * (b - a) for a, b in zip(zone["center"], zone["next_center"]))
+    radius = zone["radius"] + fraction * (zone["next_radius"] - zone["radius"])
+    return center, radius
+
+
 class Bot:
     name='Martin Brooke / Skirmisher'
 
@@ -95,18 +104,26 @@ class Bot:
                 other=next((i for i,w in enumerate(me['weapons']) if w['kind']!='gun'),None)
                 if other is not None and value[q['kind']]>value[me['weapons'][other]['kind']] and not me['weapons'][other].get('charge',0):
                     a.update(take=q['id'],drop=other);break
-        # Choose a safe economic objective, then move to the upcoming circle early.
-        center=zone['next_center'];safe_r=max(0,zone['next_radius']-20)
+        # Reserve time to reach the upcoming circle while still using its safe interior.
+        center = zone['next_center']
+        next_radius = zone['next_radius']
+        safe_r = next_radius - min(12, next_radius * .3)
         dnext=math.dist(p[:2],center)
-        travel=max(0,dnext-safe_r)/max(1,stats.get('walk_speed',11.7))
-        urgent=not me['in_zone'] or t+travel+12>zone['shrink_start']
+        travel = max(0, dnext - safe_r) / max(1, .8 * stats['walk_speed'])
+        safe_center, safe_radius = projected_zone(zone, t, 5)
+        safe_margin = min(8, safe_radius * .3)
+        urgent = (
+            not me['in_zone']
+            or math.dist(p[:2], safe_center) > safe_radius - safe_margin
+            or (travel > 0 and t + travel + 8 >= zone['shrink_end'])
+        )
         goal=center
         arrival=min(4., zone['radius']*.5)
         priorities=[]
         def candidate(q,reward,arrival_radius=4.):
             d=math.dist(p[:2],q['pos'][:2])
             if abs(q['pos'][2]-z)>8:return
-            if math.dist(q['pos'][:2],zone['center'])>zone['radius']-12:return
+            if math.dist(q['pos'][:2], safe_center) > safe_radius - safe_margin:return
             danger=sum(max(0,95-math.dist(q['pos'][:2],e['pos'][:2])) for e in enemies)
             priorities.append((d-reward+danger*(1.2 if recovering else .45),q['pos'],arrival_radius))
         if not urgent:
@@ -128,9 +145,10 @@ class Bot:
             radial=max(-1,min(1,(desired-nearest)/35))
             tangent=.8*self.direction
             goal=(x+35*(ux*radial-uy*tangent),y+35*(uy*radial+ux*tangent))
-            cg=math.dist(goal,zone['center'])
-            if cg>zone['radius']-15:
-                f=max(0,zone['radius']-15)/max(1,cg);goal=(zone['center'][0]+(goal[0]-zone['center'][0])*f,zone['center'][1]+(goal[1]-zone['center'][1])*f)
+            cg = math.dist(goal, safe_center)
+            if cg > safe_radius - safe_margin:
+                fraction = (safe_radius - safe_margin) / cg
+                goal = tuple(c + (g - c) * fraction for c, g in zip(safe_center, goal))
         if recovering and threat and not urgent:
             hidden=[]
             muzzle=stats.get('eye_height',8)
@@ -139,7 +157,7 @@ class Bot:
                 theta=i*math.pi/6
                 xx,yy=x+35*math.cos(theta),y+35*math.sin(theta)
                 zz=self.arena.height(xx,yy)
-                if math.dist((xx,yy),zone['center'])>zone['radius']-12:continue
+                if math.dist((xx, yy), safe_center) > safe_radius - safe_margin:continue
                 if not self.arena.walkable(xx,yy,zz,radius+.5,stats.get('height',9)):continue
                 if not self.arena.clear(eye,(xx,yy,zz+muzzle)):
                     hidden.append((math.dist((xx,yy),goal[:2]),(xx,yy)))
