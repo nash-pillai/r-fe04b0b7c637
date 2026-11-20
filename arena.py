@@ -26,6 +26,7 @@ class Arena:
             w = json.load(f)
         self.bounds = w['bounds']
         self.t = w['terrain']
+        self.map_grade = math.tan(math.radians(w['rules']['maxSlopeDeg']))
         self.heights = array.array('h')
         with open(os.path.join(folder, 'v2/terrain.i16'), 'rb') as f:
             self.heights.frombytes(f.read())
@@ -46,7 +47,10 @@ class Arena:
         self.grid = bytearray(self.nx*self.ny)
         cache = os.path.join(os.path.dirname(__file__), 'navigation.json')
         checksum = hashlib.sha256(json.dumps(w, separators=(',', ':')).encode()).hexdigest()
-        cached = json.load(open(cache)) if os.path.exists(cache) else None
+        cached = None
+        if os.path.exists(cache):
+            with open(cache) as f:
+                cached = json.load(f)
         if cached and cached['world_sha256'] == checksum:
             self.grid[:] = zlib.decompress(bytes.fromhex(cached['grid_zlib_hex']))
         else:
@@ -90,20 +94,27 @@ class Arena:
         b=self.bounds
         return b['minX']+pad<x<b['maxX']-pad and b['minY']+pad<y<b['maxY']-pad and not any(self.solid(x,y,z+dz,pad) for dz in (1.21,height*.5,height)) and self.height(x,y)<z+1.2
 
-    def traversable(self,pos,ux,uy,length,pad,height):
+    def traversable(self,pos,ux,uy,length,pad,height,max_grade=None):
         # Ground follows a slope. Rooftop and airborne movement retain current feet height.
         x,y,z=pos
+        if max_grade is None:max_grade=self.map_grade
         ground=self.height(x,y)
         on_ground=abs(ground-z)<1.3
         prev=ground
-        for distance in (2.,4.,6.,length):
+        # Keep the original two-metre samples and check the actual endpoint.
+        spacing=2.
+        samples=math.ceil(length/spacing)
+        previous_distance=0.
+        for i in range(1,samples+1):
+            distance=min(length,i*spacing)
             xx,yy=x+ux*distance,y+uy*distance
             h=self.height(xx,yy)
-            if on_ground and h-prev>2*math.tan(math.radians(50)):
+            if on_ground and h-prev>(distance-previous_distance)*max_grade:
                 return False
             feet=h if on_ground else z
             if not self.walkable(xx,yy,feet,pad,height):return False
             prev=h
+            previous_distance=distance
         return True
 
     def clear(self,a,b):
