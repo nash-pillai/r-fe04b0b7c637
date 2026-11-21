@@ -43,6 +43,19 @@ def projectile_risk(position, velocity, height, radius, projectiles, mortar_grav
     return risk
 
 
+def laser_lane_risk(position, height, radius, lanes):
+    x, y, z = position
+    cost = 0.
+    for ex, ey, muzzle, dx, dy, grade, reach in lanes:
+        px, py = x - ex, y - ey
+        distance = px*dx + py*dy
+        beam_height = muzzle + distance*grade
+        if 0 < distance < reach and z - 1 < beam_height < z + height + 1:
+            lateral = abs(px*dy - py*dx)
+            cost += 8 * max(0., radius + 1 - lateral)
+    return cost
+
+
 class Bot:
     name='Martin Brooke / Skirmisher'
 
@@ -174,6 +187,29 @@ class Bot:
         threat_ids = {e['id'] for e in threats}
         shot = min(shots, key=lambda s: (s[1]['id'] not in threat_ids, s[0], s[1]['id']), default=None)
         return threats, shot
+
+    def charging_lanes(self, me, threats):
+        x, y, _ = me['pos']
+        stats = me['stats']
+        vision = self.config['vision']
+        near = vision['near_range'] + stats.get('near_range_bonus', 0)
+        visible = vision['range'] + stats.get('vision_bonus', 0)
+        fov = math.radians(vision['fov_deg']) / 2
+        lanes = []
+        for enemy in threats:
+            if not enemy.get('charging') or 'laser' not in enemy.get('weapons', ()):
+                continue
+            ex, ey, ez = enemy['pos']
+            distance = math.hypot(ex - x, ey - y)
+            bearing = math.atan2(ey - y, ex - x)
+            if distance > near and (distance > visible or abs(angle(bearing - me['aim'][0])) > fov):
+                continue
+            yaw, pitch = enemy['aim']
+            scale = 1 + self.config['cubes']['size_per_cube'] * enemy.get('cubes', 0)
+            muzzle = ez + self.config['mech']['muzzle_height'] * scale
+            reach = self.config['weapons']['laser']['range'] * math.cos(pitch)
+            lanes.append((ex, ey, muzzle, math.cos(yaw), math.sin(yaw), math.tan(pitch), reach))
+        return lanes
 
     def act(self,o):
         me=o['self'];p=me['pos'];x,y,z=p;t=o['t'];zone=o['zone'];a={'tick':o['tick']}
@@ -317,13 +353,19 @@ class Bot:
         projectiles = o.get('projectiles', [])
         mortar_gravity = self.config['weapons']['mortar']['gravity']
         walk_speed = stats['walk_speed']
+        lanes = self.charging_lanes(me, threats) if me['grounded'] and not urgent and zone['radius'] >= 6 else []
         hold = not (gx or gy)
         hold_risk = 0.0
         if hold and not urgent and zone['radius'] >= 6 and me['grounded']:
             hold_risk = projectile_risk(p, (0., 0.), height, radius, projectiles, mortar_gravity)
+            hold_risk += laser_lane_risk(p, height, radius, lanes)
         dodge = hold_risk >= 8
         if dodge:
             look = min(5., zone['radius'] * .35)
+        lane_distance = .35 * walk_speed
+        if lanes and any(w and w['kind'] == 'laser' and w.get('charge', 0) for w in weapons):
+            lane_distance *= stats['charge_move_mult']
+        lane_distance = min(look, lane_distance)
         best = (-hold_risk if dodge else -1e30, (0., 0.))
         for k in range(16 if not hold or dodge else 0):
             theta=k*math.pi/8;ux,uy=math.cos(theta),math.sin(theta)
@@ -340,6 +382,8 @@ class Bot:
             score -= projectile_risk(
                 p, (ux * walk_speed, uy * walk_speed), height, radius, projectiles, mortar_gravity
             )
+            if lanes:
+                score -= laser_lane_risk((x + ux*lane_distance, y + uy*lane_distance, z), height, radius, lanes)
             if score>best[0]:best=(score,(ux,uy))
         move = best[1]
         self.stuck=self.stuck+1 if self.previous and math.dist(p[:2],self.previous[:2])<.15 and (gx or gy) else 0
