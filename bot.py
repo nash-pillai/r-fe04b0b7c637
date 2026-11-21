@@ -43,6 +43,19 @@ def projectile_risk(position, velocity, height, radius, projectiles, mortar_grav
     return risk
 
 
+def projected_velocity(current, target, acceleration):
+    dx, dy = target[0] - current[0], target[1] - current[1]
+    change = math.hypot(dx, dy)
+    available = acceleration * .4
+    if available <= 0:
+        return current[:2]
+    if change <= available:
+        weight = 1 - .5 * change / available
+    else:
+        weight = .5 * available / change
+    return current[0] + dx * weight, current[1] + dy * weight
+
+
 class Bot:
     name='Martin Brooke / Skirmisher'
 
@@ -313,14 +326,24 @@ class Bot:
         else:
             wp=self.arena.waypoint(p,self.goal)
         gx,gy=unit(wp[0]-x,wp[1]-y)
+        self.stuck=self.stuck+1 if self.previous and math.dist(p[:2],self.previous[:2])<.15 and (gx or gy) else 0
+        self.previous=p
+        a['jump']=bool(me['grounded'] and self.stuck>8)
+        escape = (crossfire and not urgent) or (recovering and nearest_threat and math.dist(nearest_threat['pos'][:2],p[:2])<120)
+        a['boost']=bool(energy>35 and (not me['in_zone'] or escape or self.stuck>8))
+        speed=stats['boost_speed'] if a['boost'] else stats['walk_speed']
         # Evaluate local trajectories against walls, zone, and imminent projectiles.
         projectiles = o.get('projectiles', [])
         mortar_gravity = self.config['weapons']['mortar']['gravity']
-        walk_speed = stats['walk_speed']
         hold = not (gx or gy)
+        predict_motion = me['grounded'] and (hold or (escape and a['boost']))
+        avoid_speed = speed if predict_motion else stats['walk_speed']
+        if predict_motion and projectiles and any(w and w['kind'] == 'laser' and w.get('charge', 0) for w in weapons):
+            avoid_speed *= stats['charge_move_mult']
         hold_risk = 0.0
-        if hold and not urgent and zone['radius'] >= 6 and me['grounded']:
-            hold_risk = projectile_risk(p, (0., 0.), height, radius, projectiles, mortar_gravity)
+        if hold and not urgent and zone['radius'] >= 6 and me['grounded'] and projectiles:
+            coast = projected_velocity(me['vel'], (0., 0.), stats['ground_accel'])
+            hold_risk = projectile_risk(p, coast, height, radius, projectiles, mortar_gravity)
         dodge = hold_risk >= 8
         if dodge:
             look = min(5., zone['radius'] * .35)
@@ -337,18 +360,14 @@ class Bot:
                 # Periodic lateral variation frustrates constant-velocity projectile leading.
                 ex,ey=unit(threat['pos'][0]-x,threat['pos'][1]-y)
                 score+=.7*math.sin(t*2.2+self.phase)*(ux*(-ey)+uy*ex)
-            score -= projectile_risk(
-                p, (ux * walk_speed, uy * walk_speed), height, radius, projectiles, mortar_gravity
-            )
+            if projectiles:
+                motion = (ux * avoid_speed, uy * avoid_speed)
+                if predict_motion:
+                    motion = projected_velocity(me['vel'], motion, stats['ground_accel'])
+                score -= projectile_risk(p, motion, height, radius, projectiles, mortar_gravity)
             if score>best[0]:best=(score,(ux,uy))
         move = best[1]
-        self.stuck=self.stuck+1 if self.previous and math.dist(p[:2],self.previous[:2])<.15 and (gx or gy) else 0
         if self.stuck>8 and best[0]<-1e20:move=(gx,gy)
-        self.previous=p
-        a['jump']=bool(me['grounded'] and self.stuck>8)
-        escape = (crossfire and not urgent) or (recovering and nearest_threat and math.dist(nearest_threat['pos'][:2],p[:2])<120)
-        a['boost']=bool(energy>35 and (not me['in_zone'] or escape or self.stuck>8))
-        speed=stats['boost_speed'] if a['boost'] else stats['walk_speed']
         match=self.config['match']
         interval=match['decide_every']/match['tick_hz']
         move_distance = look if dodge else distance
