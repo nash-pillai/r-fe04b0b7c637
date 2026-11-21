@@ -145,9 +145,9 @@ class Arena:
             if cs: return min(cs,key=lambda q:math.dist(self.xy(q),p[:2]))
         return c
 
-    def waypoint(self,pos,goal):
+    def waypoint(self,pos,goal,exact_cell=False):
         target=self.nearest(goal)
-        if self.goal is None or math.dist(self.goal,target)>3:
+        if self.goal is None or math.dist(self.goal,target)>(0 if exact_cell else 3):
             self.goal=target
             start=self.nearest(pos)
             self.search=([(math.dist(start,target),0,start)],{start:0},{},start)

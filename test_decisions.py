@@ -91,7 +91,7 @@ class DecisionTests(unittest.TestCase):
     def test_close_goal_behind_wall_uses_waypoint(self):
         self.obs["cubes"] = [dict(id=5000, pos=[7, 0, 0])]
         self.bot.arena.solid = lambda x, y, z, pad=0: 2 <= x < 3 and abs(y) <= 2
-        self.bot.arena.waypoint = lambda *args: (0, 8)
+        self.bot.arena.waypoint = lambda *args, **kwargs: (0, 8)
         self.assertGreater(self.bot.act(self.obs)["move"][1], .9)
 
     def test_contested_cube_keeps_escape_direction(self):
@@ -133,6 +133,52 @@ class DecisionTests(unittest.TestCase):
                                 radius=100, next_radius=70)
         self.obs["cubes"] = [dict(id=5000, pos=[-84, 0, 0])]
         self.assertEqual(self.bot.act(self.obs)["move"], [0, 0])
+
+    def final_ring_route(self, loot_xy, center_xy, start_time):
+        arena = self.bot.arena = copy.copy(self.template.arena)
+        # Use the exact grid coordinates so a cached terminal waypoint is at our feet.
+        loot = arena.xy(arena.cell(loot_xy))
+        center = arena.xy(arena.cell(center_xy))
+        self.obs["zone"].update(center=center, next_center=center, next_radius=0,
+                                shrink_start=390, shrink_end=415, dps=260)
+        self.obs["cubes"] = [dict(id=5000, pos=[*loot, arena.height(*loot)])]
+        self.me["grounded"] = True
+        self.ring_observation(center, start_time)
+        self.assertEqual(arena.goal, arena.cell(loot))
+        self.obs["cubes"] = []
+        return loot, center
+
+    def ring_observation(self, xy, now):
+        zone = self.obs["zone"]
+        zone["radius"] = min(25, zone["shrink_end"] - now)
+        self.me.update(pos=[*xy, self.bot.arena.height(*xy)],
+                       in_zone=math.dist(xy, zone["center"]) <= zone["radius"])
+        self.obs.update(t=now, tick=round(now * self.bot.config["match"]["tick_hz"]))
+        return self.bot.act(self.obs)
+
+    def test_urgent_ring_leaves_collected_cube_on_campus(self):
+        loot, center = self.final_ring_route((-137.38, 46.91), (-147.38, 46.91), 394.4)
+        for now in (395.8, 399., 405.1):
+            with self.subTest(now=now):
+                action = self.ring_observation(loot, now)
+                self.assertLess(action["move"][0], -.99)
+                self.assertEqual(action["boost"], not self.me["in_zone"])
+                self.assertEqual(self.bot.arena.goal, self.bot.arena.cell(center))
+
+    def test_urgent_ring_replans_around_campus_obstacle(self):
+        loot, center = self.final_ring_route((-122.38, 56.91), (-112.38, 46.91), 387.)
+        arena = self.bot.arena
+        action = self.ring_observation(loot, 397.)
+        distance = math.dist(loot, center)
+        direct = [(b-a)/distance for a,b in zip(loot, center)]
+        stats = self.me["stats"]
+        body = (stats["radius"] + .3, stats["height"], math.tan(math.radians(stats["max_slope_deg"])))
+        self.assertFalse(arena.traversable(self.me["pos"], *direct, distance, *body))
+        self.assertLess(action["move"][1], -.99)
+        self.assertTrue(arena.traversable(self.me["pos"], *action["move"], 8, *body))
+        path = arena.path
+        self.ring_observation(loot, 397.1)
+        self.assertIs(arena.path, path)
 
     def test_approach_half_meter_does_not_probe_beyond_goal(self):
         self.bot.arena.solid = lambda x, y, z, pad=0: x >= 1.5
@@ -190,7 +236,7 @@ class DecisionTests(unittest.TestCase):
 
     def opponent(self, ident, x, y, hp=1400, weapon="gun", aiming_at_us=True):
         # The new fixtures assert tactical headings on open ground.
-        self.bot.arena.waypoint = lambda pos, goal: goal
+        self.bot.arena.waypoint = lambda pos, goal, exact_cell=False: goal
         enemy = self.enemy(x, y)
         yaw = math.atan2(-y, -x) if aiming_at_us else math.atan2(y, x)
         enemy.update(id=ident, hp=hp, max_hp=1400, weapons=[weapon], aim=[yaw, 0])

@@ -369,7 +369,9 @@ class Bot:
                 if not self.arena.clear(eye,(xx,yy,zz+muzzle)):
                     hidden.append((math.dist((xx,yy),goal[:2]),(xx,yy)))
             if hidden:goal=min(hidden)[1];arrival=4.
-        if cover_goal is None and (self.goal is None or math.dist(goal[:2],self.goal[:2])>18 or t-self.last_goal>3):
+        # A nearby loot destination may already be outside the closing circle.
+        goal_tolerance = 0 if urgent else 18
+        if cover_goal is None and (self.goal is None or math.dist(goal[:2],self.goal[:2])>goal_tolerance or t-self.last_goal>3):
             self.goal=goal;self.last_goal=t
         distance=math.dist(goal[:2],p[:2])
         look=min(8.,distance)
@@ -380,7 +382,7 @@ class Bot:
         elif cover_goal is not None or (distance<=8 and self.arena.traversable(p,*direct,distance,radius+.3,height,max_grade)):
             wp=goal
         else:
-            wp=self.arena.waypoint(p,self.goal)
+            wp=self.arena.waypoint(p,self.goal,exact_cell=urgent)
         gx,gy=unit(wp[0]-x,wp[1]-y)
         # Evaluate local trajectories against walls, zone, and imminent projectiles.
         projectiles = o.get('projectiles', [])
