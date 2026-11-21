@@ -65,6 +65,8 @@ class Bot:
         self.direction=1 if hello['slot']%2 else -1
         self.focus_id = None
         self.pursuit = None
+        self.opening_id = None
+        self.opening_resume = 0.
 
     def aim_at(self,me,target,weapon):
         kind=weapon['kind'];s=weapon['stats'];p=me['pos']
@@ -175,6 +177,80 @@ class Bot:
         shot = min(shots, key=lambda s: (s[1]['id'] not in threat_ids, s[0], s[1]['id']), default=None)
         return threats, shot
 
+    def opening_route(self, o, pickups, shot, safe_center, safe_radius):
+        me = o['self']
+        p, stats = me['pos'], me['stats']
+        gun = next((w for w in me['weapons'] if w and w['kind'] == 'gun'), None)
+        if shot and shot[1].get('hp', 0) < .4 * min(me['hp'], shot[1].get('max_hp', self.config['mech']['hp'])):
+            return None
+        if any(w and w.get('charge', 0) for w in me['weapons']):
+            return None
+        empty = None in me['weapons']
+        if not empty and me['cubes'] >= 3:
+            return None
+        speed = stats['walk_speed']
+        grade = math.tan(math.radians(stats['max_slope_deg']))
+        if abs(p[2] - self.arena.height(*p[:2])) >= 1.3:
+            return None
+        offers = []
+        for group, objects, radius in (
+                ('cube', o['cubes'], self.config['cubes']['pickup_radius']),
+                ('weapon', pickups, self.config['loot']['pickup_radius']),
+                ('crate', o['crates'], self.config['cubes']['pickup_radius'])):
+            for obj in objects:
+                q = obj['pos']
+                distance = math.dist(p[:2], q[:2])
+                if distance > min(self.config['vision']['near_range'], speed * 3.5):
+                    continue
+                feet = self.arena.height(*q[:2])
+                if abs(q[2] - feet) >= 4 or math.dist(q[:2], safe_center) > safe_radius:
+                    continue
+                # The projected ring covers arrival. Also reserve the walk back to the next circle.
+                zone = o['zone']
+                eta = max(0., distance - radius * .95) / speed
+                home = max(0., math.dist(q[:2], zone['next_center']) -
+                           (zone['next_radius'] - min(12., zone['next_radius'] * .3)))
+                if o['t'] + eta + home / (.8 * speed) + 8 >= zone['shrink_end']:
+                    continue
+                # Avoid walking into proximity fire or handing a closer opponent the loot.
+                if any(math.dist(e['pos'][:2], q[:2]) < distance + radius or
+                       math.dist(e['pos'][:2], q[:2]) < (1.5 * self.config['vision']['near_range']
+                       if e['kind'] == 'mech' else self.config['npc']['aggro_range']) for e in o['mechs']):
+                    continue
+                if group == 'weapon':
+                    eta += .35 if not empty else 0.
+                if group == 'crate':
+                    if not empty or not gun or gun['reload'] or not obj.get('hp'):
+                        continue
+                    damage = gun['stats']['damage'] * (1 + self.config['cubes']['damage_per_cube']
+                                                        * min(me['cubes'], self.config['cubes']['stat_cap']))
+                    rounds = math.ceil(obj['hp'] / damage)
+                    if rounds + 2 > gun['ammo']:
+                        continue
+                    bearing = math.atan2(q[1] - p[1], q[0] - p[0])
+                    slew = abs(angle(bearing - me['aim'][0])) / stats['turn_rate']
+                    burst = max(slew, gun['cooldown']) + (rounds - 1) * gun['stats']['cooldown']
+                    eta = max(eta, burst) + .65  # Ammo and torso time have value even while walking.
+                if obj['id'] == self.opening_id:
+                    eta -= .35
+                offers.append((eta, obj['id'], group, obj, radius * .95, distance))
+        for _, _, group, obj, radius, distance in sorted(offers)[:6]:
+            q = obj['pos']
+            direction = unit(q[0] - p[0], q[1] - p[1])
+            if not self.arena.traversable(p, *direction, distance, stats['radius'] + .3,
+                                          stats['height'], grade):
+                continue
+            crate_shot = None
+            if group == 'crate':
+                crate_shot = self.shot_option(me, dict(obj, kind='crate'), gun)
+                if not crate_shot or not stats['min_pitch'] <= crate_shot[2][1] <= stats['max_pitch']:
+                    continue
+                # Leave enough horizontal separation to depress the gun until the crate breaks.
+                dz = p[2] + stats['muzzle_height'] - q[2] - .52 * self.config['crates']['height']
+                radius = max(radius, dz / max(.1, math.tan(-stats['min_pitch'])) + 2.)
+            return obj, radius, crate_shot
+        return None
+
     def act(self,o):
         me=o['self'];p=me['pos'];x,y,z=p;t=o['t'];zone=o['zone'];a={'tick':o['tick']}
         hp=me['hp']/me['max_hp'];energy=me['energy'];stats=me['stats'];radius=stats.get('radius',2.5)
@@ -197,12 +273,19 @@ class Bot:
         threat = target if target is not None and (not threats or target in threats) else nearest_threat
         value={'gun':0,'mortar':1,'lightning':2,'laser':3}
         pickups=[q for q in o['pickups'] if q['kind'] not in held]
-        for q in sorted(pickups,key=lambda q:-value[q['kind']]):
+        replacement = None
+        takeable = pickups
+        if None not in weapons:
+            replacement = next((i for i,w in enumerate(weapons) if w['kind'] != 'gun'), None)
+            takeable = [q for q in pickups if replacement is not None
+                        and not weapons[replacement].get('charge', 0)
+                        and value[q['kind']] > value[weapons[replacement]['kind']]]
+        for q in sorted(takeable,key=lambda q:-value[q['kind']]):
             if math.dist(q['pos'][:2],p[:2])<self.config['loot']['pickup_radius'] and abs(q['pos'][2]-z)<4:
-                if None in me['weapons']:a['take']=q['id'];break
-                other=next((i for i,w in enumerate(me['weapons']) if w['kind']!='gun'),None)
-                if other is not None and value[q['kind']]>value[me['weapons'][other]['kind']] and not me['weapons'][other].get('charge',0):
-                    a.update(take=q['id'],drop=other);break
+                a['take'] = q['id']
+                if replacement is not None:
+                    a['drop'] = replacement
+                break
         # Reserve time to reach the upcoming circle while still using its safe interior.
         center = zone['next_center']
         next_radius = zone['next_radius']
@@ -235,6 +318,16 @@ class Bot:
                 if q['lands_in']<18 and (q['holder'] in (None,me['id'])):candidate(q,90 if hp<.65 else 50)
             if priorities:_,goal,arrival=min(priorities)
             elif dnext<safe_r*.65:goal=p[:2]
+        opening = None
+        if t < min(45., self.config['zone']['phases'][0]['hold_s']):
+            npc_close = any(e['kind'] == 'npc' and math.dist(e['pos'][:2], p[:2]) <
+                            self.config['npc']['aggro_range'] for e in o['mechs'])
+            if threats or npc_close or o['projectiles'] or o.get('beams') or any(e['type'] == 'damaged' for e in o['events']):
+                self.opening_resume = t + 1.
+            elif (t >= self.opening_resume and not urgent and not recovering and me['grounded']
+                  and not o.get('drops') and (pickups or o['cubes'] or o['crates'])):
+                opening = self.opening_route(o, takeable, shot, safe_center, safe_radius - safe_margin)
+        self.opening_id = opening[0]['id'] if opening else None
         # Only remember the last open, favorable approach. A tracked position behind
         # cover, a kill, or a second firing lane must never extend the chase.
         if (urgent or recovering or threats or target or priorities or
@@ -279,6 +372,9 @@ class Bot:
                     self.pursuit = (tuple(threat['pos'][:2]), t + 1.)
         elif self.pursuit:
             combat_goal = self.pursuit[0]
+        if opening:
+            goal, arrival = opening[0]['pos'], opening[1]
+            combat_goal = self.pursuit = None
         if combat_goal is not None:
             goal = combat_goal
             arrival=4.
@@ -308,7 +404,7 @@ class Bot:
         direct=unit(goal[0]-x,goal[1]-y)
         if distance<=arrival:
             wp=p
-        elif distance<=8 and self.arena.traversable(p,*direct,distance,radius+.3,height,max_grade):
+        elif opening or (distance<=8 and self.arena.traversable(p,*direct,distance,radius+.3,height,max_grade)):
             wp=goal
         else:
             wp=self.arena.waypoint(p,self.goal)
@@ -356,7 +452,10 @@ class Bot:
         a['move']=[component*fraction for component in move]
         # Shared torso aim favors laser hitscan, then gun, then ballistics.
         options = [shot] if shot else []
-        if not recovering and not threats:
+        if opening and opening[2]:
+            options = [opening[2]]
+            primary = gun_for_mortar
+        elif not recovering and not threats:
             targets = [dict(q,kind='crate') for q in o['crates']]
             targets += [e for e in o['mechs'] if e['kind']=='npc' and math.dist(e['pos'][:2],p[:2])<110]
             for target in targets:
