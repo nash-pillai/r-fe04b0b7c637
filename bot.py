@@ -175,6 +175,52 @@ class Bot:
         shot = min(shots, key=lambda s: (s[1]['id'] not in threat_ids, s[0], s[1]['id']), default=None)
         return threats, shot
 
+    def laser_contact(self, obs, enemy, arc_stats, ready_in):
+        """Return the direct aim and whether range also holds through an equip delay."""
+        me = obs['self']
+        if self.recovering or me['energy'] <= arc_stats['energy'] + 10:
+            return None
+        stats = me['stats']
+        x, y, z = me['pos']
+        ex, ey, ez = enemy['pos']
+        scale = 1 + self.config['cubes']['size_per_cube'] * enemy.get('cubes', 0)
+        body = (ex, ey, ez + .52 * self.config['mech']['height'] * scale)
+        offset = (ex - x, ey - y, body[2] - z - stats['muzzle_height'])
+        reach = arc_stats['range']
+        distance = math.hypot(*offset)
+        relative = tuple(a - b for a, b in zip(enemy['vel'], me['vel']))
+        def within(seconds):
+            return sum((d + v * seconds)**2 for d, v in zip(offset, relative)) < reach**2
+        equip_delay = max(self.config['loot']['equip_s'], arc_stats['cooldown'])
+        available = distance < reach and within(ready_in)
+        sustained = within(equip_delay)
+        if not (available or sustained):
+            return None
+        horizontal = math.hypot(*offset[:2])
+        yaw = math.atan2(offset[1], offset[0])
+        vision = self.config['vision']
+        if horizontal > vision['near_range'] + stats.get('near_range_bonus', 0) and (
+                horizontal > vision['range'] + stats.get('vision_bonus', 0) or
+                abs(angle(yaw - me['aim'][0])) > math.radians(vision['fov_deg']) / 2):
+            return None
+        if not (self.arena.clear((x, y, z + stats['eye_height']), body) and
+                self.arena.clear((x, y, z + stats['muzzle_height']), body)):
+            return None
+        # Lightning selects the nearest object in its yaw cone. Do not count on a chain.
+        muzzle = (x, y, z + stats['muzzle_height'])
+        for obj in (*obs['crates'], *obs['mechs']):
+            if obj is enemy:
+                continue
+            ox, oy, oz = obj['pos']
+            if abs(angle(math.atan2(oy - y, ox - x) - yaw)) > math.radians(arc_stats['cone_deg']):
+                continue
+            height = self.config['npc' if obj.get('kind') == 'npc' else 'crates']['height']
+            center = (ox, oy, oz + .5 * height)
+            if math.dist(muzzle, center) <= distance and self.arena.clear(muzzle, center):
+                return None
+        aim = (yaw, math.atan2(offset[2], max(horizontal, .01)), horizontal, True) if available else None
+        return aim, sustained
+
     def act(self,o):
         me=o['self'];p=me['pos'];x,y,z=p;t=o['t'];zone=o['zone'];a={'tick':o['tick']}
         hp=me['hp']/me['max_hp'];energy=me['energy'];stats=me['stats'];radius=stats.get('radius',2.5)
@@ -192,17 +238,41 @@ class Bot:
         mortar=next((w for w in weapons if w and w['kind']=='mortar' and w['cooldown']<=.05),None)
         if mortar and gun_for_mortar and (gun_for_mortar.get('reload',0)>0 or gun_for_mortar.get('ammo',0)==0):primary=mortar
         threats, shot = self.assess_opponents(o, enemies, primary)
+        match = self.config['match']
+        interval = match['decide_every'] / match['tick_hz']
+        arc_weapon = next((w for w in weapons if w and w['kind'] == 'lightning'), None)
+        value={'gun':0,'mortar':1,'lightning':2,'laser':3}
+        pickups=[q for q in o['pickups'] if q['kind'] not in held]
+        nearby = [q for q in pickups if math.dist(q['pos'][:2],p[:2]) < self.config['loot']['pickup_radius']
+                  and abs(q['pos'][2] - z) < 4]
+        laser_duel = len(enemies) == 1 and 'laser' in enemies[0].get('weapons', ())
+        arc_aim = None
+        sustained = False
+        prefer_arc = False
+        shot_weapon = primary
+        if laser_duel and threats and (arc_weapon or any(q['kind'] == 'lightning' for q in nearby)):
+            arc_stats = arc_weapon['stats'] if arc_weapon else self.config['weapons']['lightning']
+            ready_in = min(interval, arc_weapon['cooldown']) if arc_weapon else interval
+            contact = self.laser_contact(o, enemies[0], arc_stats, ready_in)
+            if contact:
+                arc_aim, sustained = contact
+                # Keep a working gun lead. A wall across its lead can still leave the body exposed.
+                if arc_aim and arc_weapon and arc_weapon['cooldown'] < interval and primary is gun_for_mortar and not shot:
+                    shot_weapon = arc_weapon
+                    shot = (0., enemies[0], arc_aim)
+                # An existing laser is expensive to re-equip. Prefer the counter on an open
+                # slot or over mortar, and keep a held arc while it is still in contact.
+                prefer_arc = 'laser' not in held and (sustained or (arc_weapon is not None and arc_aim is not None))
+                if prefer_arc:
+                    value['lightning'] = 4
         nearest_threat = min(threats, key=lambda e: math.dist(e['pos'], p), default=None)
         target = shot[1] if shot else None
         threat = target if target is not None and (not threats or target in threats) else nearest_threat
-        value={'gun':0,'mortar':1,'lightning':2,'laser':3}
-        pickups=[q for q in o['pickups'] if q['kind'] not in held]
-        for q in sorted(pickups,key=lambda q:-value[q['kind']]):
-            if math.dist(q['pos'][:2],p[:2])<self.config['loot']['pickup_radius'] and abs(q['pos'][2]-z)<4:
-                if None in me['weapons']:a['take']=q['id'];break
-                other=next((i for i,w in enumerate(me['weapons']) if w['kind']!='gun'),None)
-                if other is not None and value[q['kind']]>value[me['weapons'][other]['kind']] and not me['weapons'][other].get('charge',0):
-                    a.update(take=q['id'],drop=other);break
+        for q in sorted(nearby,key=lambda q:-value[q['kind']]):
+            if None in me['weapons']:a['take']=q['id'];break
+            other=next((i for i,w in enumerate(me['weapons']) if w['kind']!='gun'),None)
+            if other is not None and value[q['kind']]>value[me['weapons'][other]['kind']] and not me['weapons'][other].get('charge',0):
+                a.update(take=q['id'],drop=other);break
         # Reserve time to reach the upcoming circle while still using its safe interior.
         center = zone['next_center']
         next_radius = zone['next_radius']
@@ -228,7 +298,7 @@ class Bot:
         if not urgent:
             for q in o['cubes']:candidate(q,70,self.config['cubes']['pickup_radius']*.95)
             for q in pickups:
-                if None in me['weapons'] or (q['kind']=='laser' and 'laser' not in held):candidate(q,55,self.config['loot']['pickup_radius']*.95)
+                if None in me['weapons'] or (q['kind']=='laser' and 'laser' not in held and not prefer_arc):candidate(q,55,self.config['loot']['pickup_radius']*.95)
             if not recovering:
                 for q in o['crates']:candidate(q,15)
             for q in o.get('drops',[]):
@@ -258,10 +328,12 @@ class Bot:
             ex,ey=threat['pos'][:2];ux,uy=unit(x-ex,y-ey)
             distance = math.hypot(x-ex, y-ey)
             reach = primary['stats'].get('range', 230) if primary else self.config['weapons']['gun']['range']
-            lightning = next((w['stats'] for w in weapons if w and w['kind'] == 'lightning'), None)
+            lightning = arc_weapon['stats'] if arc_weapon else None
             arc_ready = lightning and energy > lightning['energy'] + 10
+            if laser_duel:
+                arc_ready = arc_ready and arc_aim is not None and sustained
             can_attack = target is threat and not recovering and (arc_ready or
-                not primary.get('reload', 0) and primary.get('ammo', 1) > 0)
+                primary and shot_weapon is primary and not primary.get('reload', 0) and primary.get('ammo', 1) > 0)
             weak = can_attack and threat.get('hp', me['max_hp']) < .4 * min(me['hp'], threat.get('max_hp', self.config['mech']['hp']))
             if threats or (can_attack and distance < .7*reach and
                            (not priorities or weak and distance < math.dist(p[:2], goal[:2]))):
@@ -349,8 +421,6 @@ class Bot:
         escape = (crossfire and not urgent) or (recovering and nearest_threat and math.dist(nearest_threat['pos'][:2],p[:2])<120)
         a['boost']=bool(energy>35 and (not me['in_zone'] or escape or self.stuck>8))
         speed=stats['boost_speed'] if a['boost'] else stats['walk_speed']
-        match=self.config['match']
-        interval=match['decide_every']/match['tick_hz']
         move_distance = look if dodge else distance
         fraction=min(1.,move_distance/max(1e-8,speed*interval))
         a['move']=[component*fraction for component in move]
@@ -368,8 +438,8 @@ class Bot:
             _,target,sol=min(options,key=lambda q:q[0]);a['aim']=list(sol[:2])
             solutions=[]
             for weapon in weapons:
-                aim=sol if weapon is primary else None
-                if weapon and weapon is not primary:
+                aim=sol if weapon is shot_weapon else None
+                if weapon and weapon is not shot_weapon:
                     aim=self.aim_at(me,target,weapon)
                 solutions.append(aim)
             use_mortar=False
@@ -407,7 +477,11 @@ class Bot:
                             damage *= 1 + s['cookoff']
                         release = target['hp'] <= damage
                     a['fire'][i] = w['cooldown'] <= .05 and not release
-                elif kind=='lightning':a['fire'][i]=bool(clear and d<s['range'] and yaw_err<math.radians(s['cone_deg'])*.45 and energy>s.get('energy',3)+10)
+                elif kind=='lightning':
+                    in_range = d < s['range']
+                    if laser_duel and target is enemies[0] and not recovering:
+                        in_range = arc_aim is not None
+                    a['fire'][i]=bool(clear and in_range and yaw_err<math.radians(s['cone_deg'])*.45 and energy>s.get('energy',3)+10)
                 elif kind=='mortar':
                     a['fire'][i]=bool(use_mortar and aligned and clear)
         else:
