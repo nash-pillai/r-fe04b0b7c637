@@ -65,6 +65,160 @@ class Bot:
         self.direction=1 if hello['slot']%2 else -1
         self.focus_id = None
         self.pursuit = None
+        self.trades = ()
+        self.last_contact = -math.inf
+        self.unseen_hit_until = -math.inf
+        self.rest_until = -math.inf
+        self.rest_limit = -math.inf
+        self.refuge = None
+        self.next_probe = -math.inf
+        self.resting = False
+
+    def observe_trade(self, o):
+        now = o['t']
+        delay = o['self']['stats']['regen_delay']
+        incoming = outgoing = 0.
+        for event in o['events']:
+            if event['type'] not in ('damaged', 'hit') or event.get('amount', 0) <= 0:
+                continue
+            self.last_contact = now
+            attacker = event.get('by')
+            if (event['type'] == 'damaged' and attacker is not None and
+                    0 <= attacker < self.config['match']['mechs'] and attacker != o['self']['id']):
+                incoming += event['amount']
+                if not any(e['id'] == attacker for e in o['mechs']):
+                    self.unseen_hit_until = now + min(1., delay)
+            if event['type'] == 'hit' and event['target'] < self.config['match']['mechs']:
+                outgoing += event['amount']
+        if not o['self']['in_zone']:
+            self.last_contact = now
+        if incoming or outgoing:
+            self.trades += ((now, incoming - outgoing),)
+        if self.trades and now - self.trades[0][0] > delay:
+            self.trades = tuple(trade for trade in self.trades if now - trade[0] <= delay)
+        if self.resting and self.last_contact == now:
+            self.rest_until = min(self.rest_limit, max(self.rest_until, now + delay + 2.))
+
+    def immediate_finish(self, me, shot, primary):
+        if not shot:
+            return False
+        _, enemy, main_aim = shot
+        gun = next((w for w in me['weapons'] if w and w['kind'] == 'gun'), None)
+        if (not gun or not gun['ammo'] or gun['reload'] or gun['cooldown'] > .05
+                or enemy.get('hp', math.inf) > gun['stats']['damage'] * (1 - self.max_armor)):
+            return False
+        yaw, pitch, d, clear = main_aim if primary is gun else self.aim_at(me, enemy, gun)
+        yaw_tol, pitch_tol = math.atan2(1.7, max(1,d)), math.atan2(2, max(1,d))
+        return (clear and d < gun['stats']['range'] * math.cos(pitch) and
+                all(abs(angle(yaw-a[0])) < yaw_tol and abs(pitch-a[1]) < pitch_tol
+                    for a in (me['aim'], main_aim)))
+
+    def rest_goal(self, o, enemies, threats, shot, primary, urgent, safe_center, safe_limit):
+        me, now = o['self'], o['t']
+        p, stats = me['pos'], me['stats']
+        hp, maximum = me['hp'], me['max_hp']
+        delay, rate = stats['regen_delay'], stats['regen_per_s']
+        if urgent or hp >= .86 * maximum or rate <= 0 or not me['grounded']:
+            self.rest_until = -math.inf
+            return None
+        debt = sum(balance for _, balance in self.trades)
+        starting = now >= self.rest_until
+        if starting and (hp > .76 * maximum or debt < max(.08 * maximum, 2 * rate)):
+            return None
+        # A pre-existing charge will release even on a false trigger. Finish the
+        # ordinary firing cycle before borrowing the torso for a withdrawal.
+        if now < self.unseen_hit_until or len(threats) > 1 or any(w and w.get('charge', 0) > 0 for w in me['weapons']):
+            return None
+        if self.immediate_finish(me, shot, primary):
+            return None
+        near = self.config['vision']['near_range']
+        if any(math.dist(e['pos'][:2], p[:2]) < near * .55 for e in threats):
+            return None
+        if any(e['kind'] == 'npc' and math.dist(e['pos'][:2], p[:2]) <
+               self.config['npc']['aggro_range'] for e in o['mechs']):
+            return None
+        # Conservatively count even a distracted or tracked mech in shooting
+        # range. With multiple possible lanes leave escape selection to combat.
+        lanes = []
+        for e in enemies:
+            reach = 0
+            for kind in e.get('weapons', ('gun',)):
+                s = self.config['weapons'][kind]
+                reach = max(reach, s['speed']**2 / s['gravity'] if kind == 'mortar' else s['range'])
+            if math.dist(p[:2], e['pos'][:2]) <= reach + stats['walk_speed'] * min(3., .6 * delay):
+                lanes.append(e)
+        if len(lanes) > 1:
+            return None
+        horizon = max(0., delay - (now - self.last_contact)) + 2.
+        center, ring = projected_zone(o['zone'], now, horizon)
+        reserve = ring - min(8., .3 * ring)
+        if math.dist(p[:2], center) > reserve:
+            return None
+        lane = lanes[0] if lanes else None
+        if lane:
+            ex, ey, ez = lane['pos']
+            scale = 1 + self.config['cubes']['size_per_cube'] * lane.get('cubes', 0)
+            muzzle = (ex, ey, ez + self.config['mech']['muzzle_height'] * scale)
+        def sheltered(q):
+            return not lane or all(not self.arena.clear(muzzle, (q[0], q[1], q[2] + height))
+                                   for height in (stats['eye_height'], .5 * stats['height']))
+        grade = math.tan(math.radians(stats['max_slope_deg']))
+        def reachable(q):
+            d = math.dist(p[:2], q[:2])
+            return (math.dist(q[:2], safe_center) <= safe_limit and math.dist(q[:2], center) <= reserve and
+                    abs(self.arena.height(*p[:2]) - p[2]) < 1.3 and
+                    abs(self.arena.height(*q[:2]) - q[2]) < 1.3 and
+                    self.arena.traversable(p, *unit(q[0]-p[0], q[1]-p[1]), d,
+                                           stats['radius'] + .3, stats['height'], grade))
+        if sheltered(p):
+            self.refuge = None
+            goal = p[:2]
+            # Only divert for nearby actual repairs along a sheltered approach.
+            repairs = [(q, self.config['cubes']['pickup_radius'] * .95) for q in o['cubes']
+                       if me['cubes'] < self.config['cubes']['stat_cap']]
+            drops = [(q, q['radius']) for q in o['drops'] if q['lands_in'] <= 0 and
+                     q['holder'] in (None, me['id']) and not any(
+                         math.dist(e['pos'][:2], q['pos'][:2]) <= q['radius'] for e in enemies)]
+            for q, arrival in sorted(drops, key=lambda item: math.dist(p, item[0]['pos'])) + sorted(
+                    repairs, key=lambda item: math.dist(p, item[0]['pos'])):
+                dest = q['pos']
+                if math.dist(p, dest) > stats['walk_speed'] or abs(p[2]-dest[2]) >= 4:
+                    continue
+                mid = tuple((a+b)*.5 for a,b in zip(p,dest))
+                if sheltered(dest) and sheltered(mid) and reachable(dest):
+                    goal = p[:2] if math.dist(p[:2], dest[:2]) <= arrival else dest[:2]
+                    break
+        else:
+            if math.dist(p[:2], lane['pos'][:2]) < near * .55:
+                return None
+            goal = self.refuge
+            if goal and not (sheltered(goal) and reachable(goal)):
+                goal = self.refuge = None
+            if goal is None:
+                if now < self.next_probe:
+                    return None
+                self.next_probe = now + .5
+                away = math.atan2(p[1]-ey, p[0]-ex)
+                # Spend at most three walking seconds reaching a firing break.
+                # Sample both lateral exits as well as the retreating half-plane.
+                outer = stats['walk_speed'] * min(3., .6 * delay)
+                for distance in (.4 * outer, outer):
+                    for offset in (0., .8, -.8, math.pi/2, -math.pi/2, 2., -2.):
+                        yaw = away + offset * self.direction
+                        x, y = p[0]+distance*math.cos(yaw), p[1]+distance*math.sin(yaw)
+                        dest = (x, y, self.arena.height(x, y))
+                        if sheltered(dest) and reachable(dest):
+                            goal = self.refuge = dest
+                            break
+                    if goal:
+                        break
+            if goal is None:
+                return None
+        if starting:
+            self.rest_until = now + max(0., delay - (now - self.last_contact)) + min(
+                10., (.86 * maximum - hp) / rate) + 1.
+            self.rest_limit = self.rest_until + delay
+        return goal
 
     def aim_at(self,me,target,weapon):
         kind=weapon['kind'];s=weapon['stats'];p=me['pos']
@@ -192,6 +346,7 @@ class Bot:
         mortar=next((w for w in weapons if w and w['kind']=='mortar' and w['cooldown']<=.05),None)
         if mortar and gun_for_mortar and (gun_for_mortar.get('reload',0)>0 or gun_for_mortar.get('ammo',0)==0):primary=mortar
         threats, shot = self.assess_opponents(o, enemies, primary)
+        self.observe_trade(o)
         nearest_threat = min(threats, key=lambda e: math.dist(e['pos'], p), default=None)
         target = shot[1] if shot else None
         threat = target if target is not None and (not threats or target in threats) else nearest_threat
@@ -216,6 +371,15 @@ class Bot:
             or math.dist(p[:2], safe_center) > safe_radius - safe_margin
             or (travel > 0 and t + travel + 8 >= zone['shrink_end'])
         )
+        rest = self.rest_goal(o, enemies, threats, shot, primary, urgent, safe_center, safe_radius - safe_margin)
+        if (rest is not None) != self.resting:
+            self.goal = None
+        self.resting = rest is not None
+        if self.resting:
+            self.pursuit = None
+            shot = target = None
+            threat = nearest_threat
+            recovering = True
         goal=center
         arrival=min(4., zone['radius']*.5)
         priorities=[]
@@ -286,7 +450,9 @@ class Bot:
             if cg > safe_radius - safe_margin:
                 fraction = (safe_radius - safe_margin) / cg
                 goal = tuple(c + (g - c) * fraction for c, g in zip(safe_center, goal))
-        if recovering and nearest_threat and not crossfire and not urgent:
+        if self.resting:
+            goal, arrival = rest, 1.
+        elif recovering and nearest_threat and not crossfire and not urgent:
             hidden=[]
             muzzle=stats.get('eye_height',8)
             eye=(threat['pos'][0],threat['pos'][1],threat['pos'][2]+8)
@@ -299,7 +465,7 @@ class Bot:
                 if not self.arena.clear(eye,(xx,yy,zz+muzzle)):
                     hidden.append((math.dist((xx,yy),goal[:2]),(xx,yy)))
             if hidden:goal=min(hidden)[1];arrival=4.
-        if self.goal is None or math.dist(goal[:2],self.goal[:2])>18 or t-self.last_goal>3:
+        if self.resting or self.goal is None or math.dist(goal[:2],self.goal[:2])>18 or t-self.last_goal>3:
             self.goal=goal;self.last_goal=t
         distance=math.dist(goal[:2],p[:2])
         look=min(8.,distance)
@@ -308,7 +474,7 @@ class Bot:
         direct=unit(goal[0]-x,goal[1]-y)
         if distance<=arrival:
             wp=p
-        elif distance<=8 and self.arena.traversable(p,*direct,distance,radius+.3,height,max_grade):
+        elif self.resting or distance<=8 and self.arena.traversable(p,*direct,distance,radius+.3,height,max_grade):
             wp=goal
         else:
             wp=self.arena.waypoint(p,self.goal)
