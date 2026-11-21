@@ -175,6 +175,37 @@ class Bot:
         shot = min(shots, key=lambda s: (s[1]['id'] not in threat_ids, s[0], s[1]['id']), default=None)
         return threats, shot
 
+    def crossfire_lane(self, p, waypoint, threats, zone, now, stats, urgent, max_grade):
+        # A retreat that follows the current rim can leave the mech on the closing side.
+        # Reserve space in the ten-second circle, but allow an oblique entry past shooters.
+        center, radius = projected_zone(zone, now, 10)
+        body = stats['radius']
+        inner = radius - max(2 * body, min(8., radius * .3))
+        if inner < 3 * body:
+            return None
+        stride = min(stats['walk_speed'], .5 * inner)
+        x, y, _ = p
+        distance = math.dist(p[:2], center)
+        if distance + stride <= inner:
+            return None
+        allowed = max(inner, distance - .65 * stride)
+        wx, wy = unit(waypoint[0] - x, waypoint[1] - y)
+        if not urgent and math.hypot(x + stride*wx - center[0], y + stride*wy - center[1]) <= allowed:
+            return None
+
+        origins = [(e['pos'][0], e['pos'][1], math.dist(p[:2], e['pos'][:2])) for e in threats]
+        lanes = []
+        for i in range(16):
+            dx, dy = math.cos(i * math.pi / 8), math.sin(i * math.pi / 8)
+            xx, yy = x + stride*dx, y + stride*dy
+            if math.hypot(xx - center[0], yy - center[1]) <= allowed:
+                clearance = min(math.hypot(xx - ex, yy - ey) - start for ex, ey, start in origins)
+                lanes.append((clearance, dx*wx + dy*wy, dx, dy))
+        for _, _, dx, dy in sorted(lanes, reverse=True):
+            if self.arena.traversable(p, dx, dy, stride, body + .3, stats['height'], max_grade):
+                return x + stride*dx, y + stride*dy
+        return None
+
     def act(self,o):
         me=o['self'];p=me['pos'];x,y,z=p;t=o['t'];zone=o['zone'];a={'tick':o['tick']}
         hp=me['hp']/me['max_hp'];energy=me['energy'];stats=me['stats'];radius=stats.get('radius',2.5)
@@ -312,6 +343,13 @@ class Bot:
             wp=goal
         else:
             wp=self.arena.waypoint(p,self.goal)
+        if (crossfire and zone['radius'] <= 70 and me['in_zone'] and me['grounded']
+                and abs(z - self.arena.height(x, y)) < 1.3 and distance > arrival):
+            lane = self.crossfire_lane(p, wp, threats, zone, t, stats, urgent, max_grade)
+            if lane is not None:
+                wp = lane
+                distance = math.dist(p[:2], lane)
+                look = min(8., distance)
         gx,gy=unit(wp[0]-x,wp[1]-y)
         # Evaluate local trajectories against walls, zone, and imminent projectiles.
         projectiles = o.get('projectiles', [])
