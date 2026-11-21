@@ -21,6 +21,28 @@ def projected_zone(zone, now, seconds):
     return center, radius
 
 
+def projectile_risk(position, velocity, height, radius, projectiles, mortar_gravity):
+    x, y, z = position
+    risk = 0.0
+    for projectile in projectiles:
+        px, py, pz = projectile['pos']
+        vx, vy, vz = projectile['vel']
+        rx, ry = px - x, py - y
+        vx -= velocity[0]
+        vy -= velocity[1]
+        closing = -(rx * vx + ry * vy)
+        if closing <= 0:
+            continue
+        time = min(.6, closing / (vx * vx + vy * vy + 1e-9))
+        closest_height = pz + vz * time
+        if projectile['kind'] == 'mortar':
+            closest_height -= .5 * mortar_gravity * time * time
+        if z - 3 < closest_height < z + height + 4:
+            miss = math.hypot(rx + vx * time, ry + vy * time)
+            risk += max(0, radius + 5 - miss) * 3
+    return risk
+
+
 class Bot:
     name='Martin Brooke / Skirmisher'
 
@@ -286,26 +308,34 @@ class Bot:
             wp=self.arena.waypoint(p,self.goal)
         gx,gy=unit(wp[0]-x,wp[1]-y)
         # Evaluate local trajectories against walls, zone, and imminent projectiles.
-        best=(-1e30,(0.,0.))
-        for k in range(16 if gx or gy else 0):
+        projectiles = o.get('projectiles', [])
+        mortar_gravity = self.config['weapons']['mortar']['gravity']
+        walk_speed = stats['walk_speed']
+        hold = not (gx or gy)
+        hold_risk = 0.0
+        if hold and not urgent and zone['radius'] >= 6 and me['grounded']:
+            hold_risk = projectile_risk(p, (0., 0.), height, radius, projectiles, mortar_gravity)
+        dodge = hold_risk >= 8
+        if dodge:
+            look = min(5., zone['radius'] * .35)
+        best = (-hold_risk if dodge else -1e30, (0., 0.))
+        for k in range(16 if not hold or dodge else 0):
             theta=k*math.pi/8;ux,uy=math.cos(theta),math.sin(theta)
             xx,yy=x+ux*look,y+uy*look
             if not self.arena.traversable(p,ux,uy,look,radius+.3,height,max_grade):continue
-            score=8*(gx*ux+gy*uy)
+            if dodge and math.dist((xx, yy), safe_center) > safe_radius - safe_margin:
+                continue
+            score = -3.0 if dodge else 8 * (gx * ux + gy * uy)
             score-=max(0,math.dist((xx,yy),zone['center'])-zone['radius']+7)*2
             if threat:
                 # Periodic lateral variation frustrates constant-velocity projectile leading.
                 ex,ey=unit(threat['pos'][0]-x,threat['pos'][1]-y)
                 score+=.7*math.sin(t*2.2+self.phase)*(ux*(-ey)+uy*ex)
-            for b in o.get('projectiles',[]):
-                bp=b['pos'];bv=b['vel'];rx=bp[0]-x;ry=bp[1]-y
-                vx=bv[0]-ux*stats.get('walk_speed',11.7);vy=bv[1]-uy*stats.get('walk_speed',11.7)
-                tau=max(0,min(.6,-(rx*vx+ry*vy)/(vx*vx+vy*vy+1e-9)))
-                miss=math.hypot(rx+vx*tau,ry+vy*tau)
-                bz=bp[2]+bv[2]*tau-(.5*self.config['weapons']['mortar']['gravity']*tau*tau if b['kind']=='mortar' else 0)
-                if z-3<bz<z+stats.get('height',9)+4:score-=max(0,radius+5-miss)*3
+            score -= projectile_risk(
+                p, (ux * walk_speed, uy * walk_speed), height, radius, projectiles, mortar_gravity
+            )
             if score>best[0]:best=(score,(ux,uy))
-        move=best[1] if gx or gy else (0.,0.)
+        move = best[1]
         self.stuck=self.stuck+1 if self.previous and math.dist(p[:2],self.previous[:2])<.15 and (gx or gy) else 0
         if self.stuck>8 and best[0]<-1e20:move=(gx,gy)
         self.previous=p
@@ -315,7 +345,8 @@ class Bot:
         speed=stats['boost_speed'] if a['boost'] else stats['walk_speed']
         match=self.config['match']
         interval=match['decide_every']/match['tick_hz']
-        fraction=min(1.,distance/max(1e-8,speed*interval))
+        move_distance = look if dodge else distance
+        fraction=min(1.,move_distance/max(1e-8,speed*interval))
         a['move']=[component*fraction for component in move]
         # Shared torso aim favors laser hitscan, then gun, then ballistics.
         options = [shot] if shot else []
