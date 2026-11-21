@@ -348,6 +348,7 @@ class Bot:
         a['jump']=bool(me['grounded'] and self.stuck>8)
         escape = (crossfire and not urgent) or (recovering and nearest_threat and math.dist(nearest_threat['pos'][:2],p[:2])<120)
         a['boost']=bool(energy>35 and (not me['in_zone'] or escape or self.stuck>8))
+        fleeing = a['boost'] and (escape or not me['in_zone'])
         speed=stats['boost_speed'] if a['boost'] else stats['walk_speed']
         match=self.config['match']
         interval=match['decide_every']/match['tick_hz']
@@ -396,6 +397,8 @@ class Bot:
                     a['fire'][i]=bool(clear and d<s.get('range',230) and aligned and agrees)
                 elif kind=='laser':
                     charge = w.get('charge', 0)
+                    if fleeing and charge == 0:
+                        continue
                     release = aligned and charge >= s['charge']
                     if (w is primary and target['kind'] == 'mech' and 'hp' in target
                             and s['min_charge'] <= charge < s['charge'] and clear
