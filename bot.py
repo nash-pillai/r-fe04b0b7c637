@@ -219,21 +219,23 @@ class Bot:
         goal=center
         arrival=min(4., zone['radius']*.5)
         priorities=[]
-        def candidate(q,reward,arrival_radius=4.):
+        sprint_for_loot = False
+        def candidate(q,reward,arrival_radius=4.,sprint=False):
             d=math.dist(p[:2],q['pos'][:2])
             if abs(q['pos'][2]-z)>8:return
             if math.dist(q['pos'][:2], safe_center) > safe_radius - safe_margin:return
             danger=sum(max(0,95-math.dist(q['pos'][:2],e['pos'][:2])) for e in enemies)
-            priorities.append((d-reward+danger*(1.2 if recovering else .45),q['pos'],arrival_radius))
+            sprint = sprint and danger == 0 and d / stats['walk_speed'] + 2 >= q.get('lands_in', 0)
+            priorities.append((d-reward+danger*(1.2 if recovering else .45),q['pos'],arrival_radius,sprint))
         if not urgent:
-            for q in o['cubes']:candidate(q,70,self.config['cubes']['pickup_radius']*.95)
+            for q in o['cubes']:candidate(q,70,self.config['cubes']['pickup_radius']*.95,sprint=True)
             for q in pickups:
-                if None in me['weapons'] or (q['kind']=='laser' and 'laser' not in held):candidate(q,55,self.config['loot']['pickup_radius']*.95)
+                if None in me['weapons'] or (q['kind']=='laser' and 'laser' not in held):candidate(q,55,self.config['loot']['pickup_radius']*.95,sprint=True)
             if not recovering:
                 for q in o['crates']:candidate(q,15)
             for q in o.get('drops',[]):
-                if q['lands_in']<18 and (q['holder'] in (None,me['id'])):candidate(q,90 if hp<.65 else 50)
-            if priorities:_,goal,arrival=min(priorities)
+                if q['lands_in']<18 and (q['holder'] in (None,me['id'])):candidate(q,90 if hp<.65 else 50,sprint=True)
+            if priorities:_,goal,arrival,sprint_for_loot=min(priorities)
             elif dnext<safe_r*.65:goal=p[:2]
         # Only remember the last open, favorable approach. A tracked position behind
         # cover, a kill, or a second firing lane must never extend the chase.
@@ -280,6 +282,7 @@ class Bot:
         elif self.pursuit:
             combat_goal = self.pursuit[0]
         if combat_goal is not None:
+            sprint_for_loot = False
             goal = combat_goal
             arrival=4.
             cg = math.dist(goal, safe_center)
@@ -347,7 +350,10 @@ class Bot:
         self.previous=p
         a['jump']=bool(me['grounded'] and self.stuck>8)
         escape = (crossfire and not urgent) or (recovering and nearest_threat and math.dist(nearest_threat['pos'][:2],p[:2])<120)
-        a['boost']=bool(energy>35 and (not me['in_zone'] or escape or self.stuck>8))
+        loot_boost = (sprint_for_loot and not recovering and me['grounded'] and energy > 65
+                      and distance > 18 and nearest > 110 and not projectiles and not threats
+                      and move[0]*direct[0] + move[1]*direct[1] > .8)
+        a['boost']=bool(loot_boost or (energy>35 and (not me['in_zone'] or escape or self.stuck>8)))
         speed=stats['boost_speed'] if a['boost'] else stats['walk_speed']
         match=self.config['match']
         interval=match['decide_every']/match['tick_hz']
