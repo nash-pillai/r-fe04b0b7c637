@@ -21,6 +21,28 @@ def projected_zone(zone, now, seconds):
     return center, radius
 
 
+def projectile_risk(position, velocity, height, radius, projectiles, mortar_gravity):
+    x, y, z = position
+    risk = 0.0
+    for projectile in projectiles:
+        px, py, pz = projectile['pos']
+        vx, vy, vz = projectile['vel']
+        rx, ry = px - x, py - y
+        vx -= velocity[0]
+        vy -= velocity[1]
+        closing = -(rx * vx + ry * vy)
+        if closing <= 0:
+            continue
+        time = min(.6, closing / (vx * vx + vy * vy + 1e-9))
+        closest_height = pz + vz * time
+        if projectile['kind'] == 'mortar':
+            closest_height -= .5 * mortar_gravity * time * time
+        if z - 3 < closest_height < z + height + 4:
+            miss = math.hypot(rx + vx * time, ry + vy * time)
+            risk += max(0, radius + 5 - miss) * 3
+    return risk
+
+
 class Bot:
     name='Martin Brooke / Skirmisher'
 
@@ -37,6 +59,72 @@ class Bot:
         self.direction=1 if hello['slot']%2 else -1
         self.focus_id = None
         self.pursuit = None
+        self.cover = None
+        self.next_cover_probe = 0.
+
+    def enemy_muzzle(self, enemy):
+        x, y, z = enemy['pos']
+        scale = 1 + self.config['cubes']['size_per_cube'] * enemy.get('cubes', 0)
+        return x, y, z + self.config['mech']['muzzle_height'] * scale
+
+    def local_cover(self, o, enemies, threats, fallback, center, safe_radius, max_grade):
+        """Look for a short, directly walkable route screened from every known lane."""
+        me, now = o['self'], o['t']
+        pos, stats = me['pos'], me['stats']
+        x, y, z = pos
+        height, pad = stats['height'], stats['radius'] + .3
+        if (not me['grounded'] or abs(z - self.arena.height(x, y)) >= 1.3
+                or len(enemies) > 3):
+            self.cover = None
+            return None
+
+        def screened(point, sources):
+            px, py = point
+            ground = self.arena.height(px, py)
+            return all(not self.arena.clear(source, (px, py, ground + h))
+                       for source in sources.values() for h in (.5 * height, .9 * height))
+
+        def reachable(point):
+            dx, dy = point[0] - x, point[1] - y
+            length = math.hypot(dx, dy)
+            return (length <= 17 and math.dist(point, center) <= safe_radius and
+                    self.arena.traversable(pos, *unit(dx, dy), length,
+                                           pad, height, max_grade))
+
+        sources = {e['id']: self.enemy_muzzle(e) for e in enemies}
+        if self.cover:
+            point, remembered, until, holding = self.cover
+            known = remembered | sources
+            interrupted = any(e['type'] in ('damaged', 'hit') for e in o['events'])
+            if now < until and len(known) <= 3 and math.dist(point, center) <= safe_radius:
+                if not threats and self.recovering and screened((x, y), known):
+                    if not holding:
+                        # Allow the live repair delay plus up to four seconds of healing.
+                        repair = (.86 * me['max_hp'] - me['hp']) / max(1., stats['regen_per_s'])
+                        until = now + stats['regen_delay'] + min(4., max(0., repair))
+                    if not holding or not interrupted:
+                        self.cover = ((x, y), known, until, True)
+                        return (x, y)
+                if (not holding and (threats or self.recovering) and
+                        reachable(point) and screened(point, known)):
+                    self.cover = (point, known, until, False)
+                    return point
+            self.cover = None
+
+        if not threats or (len(threats) < 2 and not self.recovering) or now < self.next_cover_probe:
+            return None
+        self.next_cover_probe = now + .5
+        # Try the eight bearings closest to the inherited escape in preference order.
+        # A miss leaves navigation, including its longer single-attacker retreat, intact.
+        span = min(16., 1.2 * stats['walk_speed'])
+        bearing = round(math.atan2(fallback[1] - y, fallback[0] - x) / (math.pi / 4))
+        for offset in (0, 1, -1, 2, -2, 3, -3, 4):
+            theta = (bearing + offset) * math.pi / 4
+            point = (x + span * math.cos(theta), y + span * math.sin(theta))
+            if reachable(point) and screened(point, sources):
+                self.cover = (point, sources, now + 2., False)
+                return point
+        return None
 
     def aim_at(self,me,target,weapon):
         kind=weapon['kind'];s=weapon['stats'];p=me['pos']
@@ -126,7 +214,7 @@ class Bot:
                 for kind in enemy.get('weapons', ('gun',)):
                     weapon = rules[kind]
                     reach = max(reach, weapon['speed']**2 / weapon['gravity'] if kind == 'mortar' else weapon['range'])
-                muzzle = (ex, ey, ez + self.config['mech']['muzzle_height'] * scale)
+                muzzle = self.enemy_muzzle(enemy)
                 if math.dist(muzzle, center) <= reach and self.arena.clear(muzzle, center):
                     threats.append(enemy)
             # The server can list a mech behind a wall or outside our sensors for five seconds.
@@ -258,7 +346,17 @@ class Bot:
             if cg > safe_radius - safe_margin:
                 fraction = (safe_radius - safe_margin) / cg
                 goal = tuple(c + (g - c) * fraction for c, g in zip(safe_center, goal))
-        if recovering and nearest_threat and not crossfire and not urgent:
+        max_grade=math.tan(math.radians(stats.get('max_slope_deg',self.config['mech']['max_slope_deg'])))
+        cover_goal = None
+        if urgent:
+            self.cover = None
+        elif self.cover or crossfire or (recovering and threats):
+            cover_goal = self.local_cover(o, enemies, threats, goal, safe_center,
+                                          safe_radius - safe_margin, max_grade)
+        if cover_goal is not None:
+            goal = cover_goal
+            arrival = 0.
+        elif recovering and nearest_threat and not crossfire and not urgent:
             hidden=[]
             muzzle=stats.get('eye_height',8)
             eye=(threat['pos'][0],threat['pos'][1],threat['pos'][2]+8)
@@ -271,43 +369,50 @@ class Bot:
                 if not self.arena.clear(eye,(xx,yy,zz+muzzle)):
                     hidden.append((math.dist((xx,yy),goal[:2]),(xx,yy)))
             if hidden:goal=min(hidden)[1];arrival=4.
-        if self.goal is None or math.dist(goal[:2],self.goal[:2])>18 or t-self.last_goal>3:
+        if cover_goal is None and (self.goal is None or math.dist(goal[:2],self.goal[:2])>18 or t-self.last_goal>3):
             self.goal=goal;self.last_goal=t
         distance=math.dist(goal[:2],p[:2])
         look=min(8.,distance)
         height=stats.get('height',9)
-        max_grade=math.tan(math.radians(stats.get('max_slope_deg',self.config['mech']['max_slope_deg'])))
         direct=unit(goal[0]-x,goal[1]-y)
         if distance<=arrival:
             wp=p
-        elif distance<=8 and self.arena.traversable(p,*direct,distance,radius+.3,height,max_grade):
+        elif cover_goal is not None or (distance<=8 and self.arena.traversable(p,*direct,distance,radius+.3,height,max_grade)):
             wp=goal
         else:
             wp=self.arena.waypoint(p,self.goal)
         gx,gy=unit(wp[0]-x,wp[1]-y)
         # Evaluate local trajectories against walls, zone, and imminent projectiles.
-        best=(-1e30,(0.,0.))
-        for k in range(16 if gx or gy else 0):
+        projectiles = o.get('projectiles', [])
+        mortar_gravity = self.config['weapons']['mortar']['gravity']
+        walk_speed = stats['walk_speed']
+        hold = not (gx or gy)
+        hold_risk = 0.0
+        if hold and not urgent and zone['radius'] >= 6 and me['grounded']:
+            hold_risk = projectile_risk(p, (0., 0.), height, radius, projectiles, mortar_gravity)
+        dodge = hold_risk >= 8
+        if dodge:
+            look = min(5., zone['radius'] * .35)
+        best = (-hold_risk if dodge else -1e30, (0., 0.))
+        for k in range(16 if not hold or dodge else 0):
             theta=k*math.pi/8;ux,uy=math.cos(theta),math.sin(theta)
             xx,yy=x+ux*look,y+uy*look
             if not self.arena.traversable(p,ux,uy,look,radius+.3,height,max_grade):continue
-            score=8*(gx*ux+gy*uy)
+            if (dodge or cover_goal is not None) and math.dist((xx, yy), safe_center) > safe_radius - safe_margin:
+                continue
+            score = -3.0 if dodge else 8 * (gx * ux + gy * uy)
             score-=max(0,math.dist((xx,yy),zone['center'])-zone['radius']+7)*2
             if threat:
                 # Periodic lateral variation frustrates constant-velocity projectile leading.
                 ex,ey=unit(threat['pos'][0]-x,threat['pos'][1]-y)
                 score+=.7*math.sin(t*2.2+self.phase)*(ux*(-ey)+uy*ex)
-            for b in o.get('projectiles',[]):
-                bp=b['pos'];bv=b['vel'];rx=bp[0]-x;ry=bp[1]-y
-                vx=bv[0]-ux*stats.get('walk_speed',11.7);vy=bv[1]-uy*stats.get('walk_speed',11.7)
-                tau=max(0,min(.6,-(rx*vx+ry*vy)/(vx*vx+vy*vy+1e-9)))
-                miss=math.hypot(rx+vx*tau,ry+vy*tau)
-                bz=bp[2]+bv[2]*tau-(.5*self.config['weapons']['mortar']['gravity']*tau*tau if b['kind']=='mortar' else 0)
-                if z-3<bz<z+stats.get('height',9)+4:score-=max(0,radius+5-miss)*3
+            score -= projectile_risk(
+                p, (ux * walk_speed, uy * walk_speed), height, radius, projectiles, mortar_gravity
+            )
             if score>best[0]:best=(score,(ux,uy))
-        move=best[1] if gx or gy else (0.,0.)
+        move = best[1]
         self.stuck=self.stuck+1 if self.previous and math.dist(p[:2],self.previous[:2])<.15 and (gx or gy) else 0
-        if self.stuck>8 and best[0]<-1e20:move=(gx,gy)
+        if cover_goal is None and self.stuck>8 and best[0]<-1e20:move=(gx,gy)
         self.previous=p
         a['jump']=bool(me['grounded'] and self.stuck>8)
         escape = (crossfire and not urgent) or (recovering and nearest_threat and math.dist(nearest_threat['pos'][:2],p[:2])<120)
@@ -315,7 +420,8 @@ class Bot:
         speed=stats['boost_speed'] if a['boost'] else stats['walk_speed']
         match=self.config['match']
         interval=match['decide_every']/match['tick_hz']
-        fraction=min(1.,distance/max(1e-8,speed*interval))
+        move_distance = look if dodge else distance
+        fraction=min(1.,move_distance/max(1e-8,speed*interval))
         a['move']=[component*fraction for component in move]
         # Shared torso aim favors laser hitscan, then gun, then ballistics.
         options = [shot] if shot else []

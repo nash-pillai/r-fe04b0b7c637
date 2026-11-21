@@ -59,6 +59,29 @@ class DecisionTests(unittest.TestCase):
         self.obs["cubes"] = [dict(id=5000, pos=[2, 0, 0])]
         self.assertEqual(self.bot.act(self.obs)["move"], [0, 0])
 
+    def test_stationary_bot_dodges_incoming_projectile(self):
+        self.me.update(grounded=True, in_zone=True)
+        self.obs["projectiles"] = [
+            dict(id=1, kind="gun", pos=[100, 0, 4], vel=[-250, 0, 0]),
+        ]
+        move = self.bot.act(self.obs)["move"]
+        self.assertGreater(abs(move[1]), .8)
+
+    def test_stationary_bot_ignores_departing_projectile(self):
+        self.me.update(grounded=True, in_zone=True)
+        self.obs["projectiles"] = [
+            dict(id=1, kind="gun", pos=[1, 0, 4], vel=[250, 0, 0]),
+        ]
+        self.assertEqual(self.bot.act(self.obs)["move"], [0, 0])
+
+    def test_stationary_bot_stays_inside_tiny_zone(self):
+        self.me.update(grounded=True, in_zone=True)
+        self.obs["zone"].update(radius=2, next_radius=2)
+        self.obs["projectiles"] = [
+            dict(id=1, kind="gun", pos=[100, 0, 4], vel=[-250, 0, 0]),
+        ]
+        self.assertEqual(self.bot.act(self.obs)["move"], [0, 0])
+
     def test_new_close_goal_overrides_stale_route(self):
         self.bot.goal = [-7, 0]
         self.bot.last_goal = self.obs["t"]
@@ -296,6 +319,132 @@ class DecisionTests(unittest.TestCase):
         action = self.bot.act(self.obs)
         self.assertLess(action["move"][0], -.9)
         self.assertTrue(action["boost"])
+
+    def corner(self, hurt=True):
+        self.opponent(2, 75, 3)
+        self.opponent(4, 80, -4)
+        self.me.update(grounded=True, in_zone=True)
+        if hurt:
+            self.me['hp'] = .3 * self.me['max_hp']
+        self.bot.arena.solid = lambda x, y, z, pad=0: 20 < x < 32 and y > 3
+
+    def open_lanes(self, xy, torso=.5):
+        arena = self.bot.arena
+        body = (*xy, arena.height(*xy) + torso * self.me['stats']['height'])
+        rules = self.bot.config
+        count = 0
+        for e in self.obs['mechs']:
+            x, y, z = e['pos']
+            scale = 1 + rules['cubes']['size_per_cube'] * e['cubes']
+            muzzle = (x, y, z + rules['mech']['muzzle_height'] * scale)
+            count += arena.clear(muzzle, body)
+        return count
+
+    def test_cover_crossfire_cuts_two_lanes(self):
+        self.corner(hurt=False)
+        self.assertEqual(self.open_lanes((0, 0)), 2)
+        move = self.bot.act(self.obs)['move']
+        point = tuple(1.2 * self.me['stats']['walk_speed'] * u for u in move)
+        self.assertEqual(self.open_lanes(point), 0)
+        self.assertEqual(self.open_lanes(point, .9), 0)
+
+    def campus_corner(self):
+        a = self.opponent(2, -73, 41)
+        b = self.opponent(4, -79, 47)
+        self.bot.arena = copy.copy(self.template.arena)
+        arena = self.bot.arena
+        self.me['pos'] = [-119, 47, arena.height(-119, 47)]
+        self.obs['zone'].update(center=[-119, 47], next_center=[-119, 47])
+        for enemy in (a, b):
+            x, y = enemy['pos'][:2]
+            enemy['pos'][2] = arena.height(x, y)
+            enemy['aim'] = [math.atan2(47-y, -119-x), 0]
+
+    def test_cover_on_official_campus_geometry(self):
+        self.campus_corner()
+        self.assertEqual(self.open_lanes((-119, 47)), 2)
+        move = self.bot.act(self.obs)['move']
+        span = 1.2 * self.me['stats']['walk_speed']
+        point = (-119 + span*move[0], 47 + span*move[1])
+        self.assertTrue(self.bot.arena.traversable(self.me['pos'], *move, span, 2.8, 9))
+        self.assertEqual(self.open_lanes(point), 0)
+        self.assertEqual(self.open_lanes(point, .9), 0)
+
+    def test_cover_recovering_duelist_stays_screened_from_one_shooter(self):
+        self.corner()
+        self.obs['mechs'].pop()
+        self.bot.act(self.obs)
+        self.me['pos'] = [0, 13, 0]
+        self.obs['t'] += .9
+        self.obs['cubes'] = [dict(id=5000, pos=[0, -2, 0])]
+        self.assertEqual(self.open_lanes((0, 13)), 0)
+        self.assertEqual(self.bot.act(self.obs)['move'], [0, 0])
+
+    def arrive_in_cover(self):
+        self.corner()
+        self.bot.act(self.obs)
+        # A second controlled observation, with both muzzles behind the corner.
+        self.me['pos'] = [0, 13, 0]
+        self.obs['t'] += .9
+        self.obs['cubes'] = [dict(id=5000, pos=[0, -2, 0])]
+        self.assertEqual(self.open_lanes(self.me['pos'][:2]), 0)
+        return self.bot.act(self.obs)
+
+    def test_cover_holds_past_repair_delay_even_after_tracking_expires(self):
+        action = self.arrive_in_cover()
+        self.assertEqual(action['move'], [0, 0])
+        self.obs['mechs'] = []
+        self.obs['t'] += self.me['stats']['regen_delay'] + .2
+        self.me['hp'] += .2 * self.me['stats']['regen_per_s']
+        self.assertEqual(self.bot.act(self.obs)['move'], [0, 0])
+        self.obs['t'] += 4.
+        self.assertLess(self.bot.act(self.obs)['move'][1], -.9)
+
+    def test_cover_uses_live_repair_delay_and_releases_on_health(self):
+        self.me['stats']['regen_delay'] = 8
+        self.arrive_in_cover()
+        self.obs['t'] += 9.5
+        self.assertEqual(self.bot.act(self.obs)['move'], [0, 0])
+        self.me['hp'] = .9 * self.me['max_hp']
+        self.obs['t'] += .1
+        self.assertLess(self.bot.act(self.obs)['move'][1], -.9)
+
+    def test_cover_still_dodges_at_rest(self):
+        self.arrive_in_cover()
+        self.obs['t'] += .1
+        self.obs['projectiles'] = [dict(id=99, kind='gun', pos=[0, 113, 4], vel=[0, -250, 0])]
+        self.assertGreater(abs(self.bot.act(self.obs)['move'][0]), .8)
+
+    def test_cover_breaks_for_new_open_lane(self):
+        self.arrive_in_cover()
+        self.obs['t'] += .1
+        self.opponent(9, -35, 13)
+        self.assertGreater(math.hypot(*self.bot.act(self.obs)['move']), .9)
+
+    def test_cover_breaks_for_predicted_ring(self):
+        self.arrive_in_cover()
+        self.obs['t'] = 105
+        self.obs['zone'].update(center=[0, 0], next_center=[0, -40], radius=75, next_radius=15)
+        self.assertLess(self.bot.act(self.obs)['move'][1], -.9)
+
+    def test_cover_rejects_blocked_access(self):
+        self.corner(hurt=False)
+        slab = self.bot.arena.solid
+        self.bot.arena.solid = lambda x,y,z,pad=0: slab(x,y,z,pad) or (1 < y <= 4 and z < 3)
+        # A low curb blocks travel north while both shooters can see over it.
+        self.assertLess(self.bot.act(self.obs)['move'][0], -.9)
+
+    def test_cover_rejects_hidden_point_outside_projected_ring(self):
+        self.corner(hurt=False)
+        self.obs['t'] = 100
+        self.obs['zone'].update(center=[0,-20], next_center=[0,-20], radius=45, next_radius=26)
+        move = self.bot.act(self.obs)['move']
+        self.assertLessEqual(move[1], .01)
+
+    def test_cover_low_wall_leaves_upper_body_exposed(self):
+        self.corner(hurt=False)
+        self.bot.arena.solid = lambda x,y,z,pad=0: 20 < x < 32 and y > 3 and z < 6.5
+        self.assertLess(self.bot.act(self.obs)['move'][0], -.9)
 
 
 if __name__ == "__main__":
