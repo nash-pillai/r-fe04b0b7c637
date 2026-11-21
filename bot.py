@@ -54,6 +54,11 @@ class Bot:
             for upgrade in self.config['upgrades'] for effect in upgrade['effects']
             if effect['path'] == 'mech.armor' and 'add' in effect
         )
+        self.laser_damage_modifiers = {
+            upgrade['id']: effect['mul']
+            for upgrade in self.config['upgrades'] for effect in upgrade['effects']
+            if effect['path'] == 'weapons.laser.damage' and 'mul' in effect
+        }
         self.rng=random.Random(hello['seed'])
         self.phase=self.rng.random()*6.28
         self.arena=Arena(hello['map']['dir'])
@@ -174,6 +179,29 @@ class Bot:
         threat_ids = {e['id'] for e in threats}
         shot = min(shots, key=lambda s: (s[1]['id'] not in threat_ids, s[0], s[1]['id']), default=None)
         return threats, shot
+
+    def cube_finisher(self, me, target, weapon, solution, damage_fraction):
+        cubes = self.config['cubes']
+        power = 1 + min(me['cubes'], cubes['stat_cap']) * cubes['damage_per_cube']
+        # Cap the pre-cube damage independently so a bonus in live stats cannot count twice.
+        upgraded = self.config['weapons']['laser']['damage'] * math.prod(
+            self.laser_damage_modifiers.get(pick, 1) for pick in me['upgrades'])
+        if target['hp'] > min(upgraded, weapon['stats']['damage']) * power * damage_fraction:
+            return False
+
+        stats = me['stats']
+        _, pitch, distance, _ = solution
+        near = self.config['vision']['near_range'] + stats.get('near_range_bonus', 0)
+        if math.dist(me['pos'], target['pos']) > near or not stats['min_pitch'] <= pitch <= stats['max_pitch']:
+            return False
+        x, y, z = me['pos']
+        muzzle = (x, y, z + stats['muzzle_height'])
+        body = (*target['pos'][:2], muzzle[2] + distance * math.tan(pitch))
+        actual_yaw, actual_pitch = me['aim']
+        ray_end = (x + distance * math.cos(actual_yaw), y + distance * math.sin(actual_yaw),
+                   muzzle[2] + distance * math.tan(actual_pitch))
+        eye = (x, y, z + stats['eye_height'])
+        return self.arena.clear(eye, body) and self.arena.clear(muzzle, ray_end)
 
     def act(self,o):
         me=o['self'];p=me['pos'];x,y,z=p;t=o['t'];zone=o['zone'];a={'tick':o['tick']}
@@ -402,10 +430,12 @@ class Bot:
                             and d <= s['range'] * math.cos(pitch) and aligned
                             and yaw_err < tol and pitch_err < math.atan2(2, max(1, d))):
                         # Use the documented damage floor even at partial charge.
-                        damage = s['damage'] * s['min_frac'] * (1 - self.max_armor)
-                        if 'mortar' in target.get('weapons', ()):
-                            damage *= 1 + s['cookoff']
+                        cookoff = 1 + s['cookoff'] if 'mortar' in target.get('weapons', ()) else 1
+                        damage = s['damage'] * s['min_frac'] * (1 - self.max_armor) * cookoff
                         release = target['hp'] <= damage
+                        if not release and me['cubes'] and w['cooldown'] == 0:
+                            release = self.cube_finisher(me, target, w, aim,
+                                                         s['min_frac'] * (1 - self.max_armor) * cookoff)
                     a['fire'][i] = w['cooldown'] <= .05 and not release
                 elif kind=='lightning':a['fire'][i]=bool(clear and d<s['range'] and yaw_err<math.radians(s['cone_deg'])*.45 and energy>s.get('energy',3)+10)
                 elif kind=='mortar':
