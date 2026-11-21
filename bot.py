@@ -48,6 +48,12 @@ class Bot:
 
     def __init__(self,hello):
         self.config=hello['config']
+        # Opponent upgrade stacks are hidden. Price a finishing beam against full armor.
+        self.max_armor = self.config['mech']['armor'] + sum(
+            upgrade['max'] * effect['add']
+            for upgrade in self.config['upgrades'] for effect in upgrade['effects']
+            if effect['path'] == 'mech.armor' and 'add' in effect
+        )
         self.rng=random.Random(hello['seed'])
         self.phase=self.rng.random()*6.28
         self.arena=Arena(hello['map']['dir'])
@@ -389,8 +395,18 @@ class Bot:
                             and abs(pitch-shared_pitch)<max(.015,math.atan2(2,max(1,d))))
                     a['fire'][i]=bool(clear and d<s.get('range',230) and aligned and agrees)
                 elif kind=='laser':
-                    # Keep charged until aim settles, then release at full charge.
-                    a['fire'][i]=bool(w['cooldown']<=.05 and (w.get('charge',0)<s.get('charge',.75) or not aligned))
+                    charge = w.get('charge', 0)
+                    release = aligned and charge >= s['charge']
+                    if (w is primary and target['kind'] == 'mech' and 'hp' in target
+                            and s['min_charge'] <= charge < s['charge'] and clear
+                            and d <= s['range'] * math.cos(pitch) and aligned
+                            and yaw_err < tol and pitch_err < math.atan2(2, max(1, d))):
+                        # Use the documented damage floor even at partial charge.
+                        damage = s['damage'] * s['min_frac'] * (1 - self.max_armor)
+                        if 'mortar' in target.get('weapons', ()):
+                            damage *= 1 + s['cookoff']
+                        release = target['hp'] <= damage
+                    a['fire'][i] = w['cooldown'] <= .05 and not release
                 elif kind=='lightning':a['fire'][i]=bool(clear and d<s['range'] and yaw_err<math.radians(s['cone_deg'])*.45 and energy>s.get('energy',3)+10)
                 elif kind=='mortar':
                     a['fire'][i]=bool(use_mortar and aligned and clear)
